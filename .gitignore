@@ -1,0 +1,53 @@
+# Dependencies
+node_modules/
+npm-debug.log
+yarn-error.log
+
+# Extension packaging
+*.crx
+*.pem
+*.zip
+
+# IDE and editor files
+.vscode/
+.claude/
+.idea/
+*.swp
+*.swo
+*.sublime-project
+*.sublime-workspace
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Local environment
+.env
+.env.local
+
+# Build outputs
+dist/
+build/
+
+# Development
+.temp
+
+# User data & sensitive files
+pluck_data.json
+*.db
+IndexedDB/
+*.sqlite
+
+# Chrome sync data
+chrome-storage-*
+sync-data/
+
+# Local history and cache
+.history/
+.cache/
+
+# User-defined data folders (File System Access)
+user_data/
+pluck_data/
+data/
+*.json.bak

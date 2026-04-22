@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Pluck</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: #0c0c0e;
+      font-family: 'Cascadia Code', Consolas, 'Courier New', monospace;
+      width: 200px;
+      user-select: none;
+    }
+    .menu-item {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 11px 14px;
+      cursor: pointer;
+      color: #9090a0;
+      font-size: 12px;
+      border-bottom: 1px solid #1a1a22;
+      transition: background .1s, color .1s;
+    }
+    .menu-item:last-child { border-bottom: none; }
+    .menu-item:hover { background: #111116; color: #4dfa9a; }
+    .menu-icon { font-size: 14px; width: 18px; text-align: center; flex-shrink: 0; }
+    .menu-hotkey { margin-left: auto; font-size: 9px; color: #2e2e3e; flex-shrink: 0; }
+  </style>
+</head>
+<body>
+  <div class="menu-item" id="item-settings">
+    <span class="menu-icon">⚙</span>
+    <span id="menu-settings-text">Settings</span>
+  </div>
+  <div class="menu-item" id="item-capture">
+    <span class="menu-icon">⬚</span>
+    <span id="menu-capture-text">Select Elements</span>
+    <span class="menu-hotkey">Alt+1</span>
+  </div>
+  <div class="menu-item" id="item-toggle">
+    <span class="menu-icon">▤</span>
+    <span id="menu-toggle-text">Toggle Sidebar</span>
+  </div>
+  <script src="i18n.js"></script>
+  <script src="popup.js"></script>
+</body>
+</html>

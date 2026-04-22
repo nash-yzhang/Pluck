@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Pluck — Settings</title>
+  <style>
+    :root {
+      --bg:      #0c0c0e;
+      --bg2:     #111116;
+      --bg3:     #17171c;
+      --border:  #1e1e28;
+      --border2: #2a2a38;
+      --fg:      #d0d0d8;
+      --fg2:     #9090a0;
+      --fg3:     #5a5a70;
+      --accent:  #4dfa9a;
+      --accent2: #37c97e;
+      --warn:    #ff5e57;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: var(--bg); color: var(--fg);
+      font-family: 'Cascadia Code', Consolas, 'Courier New', monospace;
+      font-size: 13px; padding: 28px 32px; min-width: 420px; max-width: 560px;
+    }
+    h1 {
+      font-size: 13px; letter-spacing: 3px; color: var(--accent);
+      margin-bottom: 8px; font-weight: 400;
+    }
+    .lang-switch {
+      display: flex; align-items: center; gap: 8px;
+      margin-bottom: 18px;
+    }
+    .lang-label {
+      font-size: 9px; letter-spacing: 2px; color: var(--fg3); opacity: .7;
+    }
+    .lang-btn {
+      font-size: 9px; letter-spacing: 1px; padding: 2px 8px;
+      background: var(--bg3); border: 1px solid var(--border2);
+      border-radius: 2px; color: var(--fg2); cursor: pointer;
+      font-family: inherit; transition: all .1s;
+    }
+    .lang-btn:hover { color: var(--accent); border-color: var(--accent); }
+    .lang-btn.active { color: var(--accent); border-color: var(--accent); background: rgba(77,250,154,.08); }
+    .about-blurb {
+      font-size: 11px; color: var(--fg3); line-height: 1.7;
+      margin-bottom: 24px; border-left: 2px solid var(--accent2);
+      padding-left: 12px;
+    }
+    .about-blurb em { color: var(--fg2); font-style: normal; }
+    .field { margin-bottom: 18px; }
+    label {
+      display: block; font-size: 9px; letter-spacing: 2px;
+      color: var(--accent); margin-bottom: 7px; opacity: .85;
+    }
+    input[type="password"], input[type="text"], select {
+      width: 100%; background: var(--bg2); border: 1px solid var(--border2);
+      border-radius: 3px; color: var(--fg); font-family: inherit; font-size: 12px;
+      padding: 7px 10px; outline: none; transition: border-color .15s;
+    }
+    input:focus, select:focus { border-color: var(--accent); }
+    input[readonly] { color: var(--fg3); cursor: default; }
+    select option { background: var(--bg2); color: var(--fg); }
+    .row { display: flex; gap: 8px; align-items: center; }
+    button {
+      background: var(--bg3); border: 1px solid var(--border2); border-radius: 3px;
+      color: var(--fg2); font-family: inherit; font-size: 10px; letter-spacing: 1.2px;
+      padding: 7px 16px; cursor: pointer; transition: all .15s; white-space: nowrap;
+    }
+    button:hover { background: var(--bg2); color: var(--accent); border-color: var(--accent); }
+    button.primary {
+      border-color: var(--accent2); color: var(--accent); background: rgba(77,250,154,.06);
+    }
+    button.primary:hover { background: rgba(77,250,154,.14); }
+    #status, #data-status {
+      font-size: 11px; color: var(--accent); letter-spacing: 1px;
+      height: 18px; margin-top: 10px; transition: color .2s;
+    }
+    .hint {
+      font-size: 10px; color: var(--fg3); margin-top: 6px; line-height: 1.6;
+    }
+    .hint code { color: var(--fg2); background: var(--bg3); padding: 1px 4px; border-radius: 2px; }
+    .section-title {
+      font-size: 9px; letter-spacing: 2.5px; color: var(--accent);
+      border-bottom: 1px solid var(--border2); padding-bottom: 7px;
+      margin-bottom: 14px; margin-top: 28px; opacity: .7;
+    }
+    #skills-list { display: flex; flex-direction: column; gap: 6px; margin-bottom: 10px; }
+    .skill-row {
+      display: flex; gap: 6px; align-items: center;
+      background: var(--bg2); border: 1px solid var(--border); border-radius: 3px;
+      padding: 6px 8px; transition: border-color .15s;
+    }
+    .skill-row:hover { border-color: var(--border2); }
+    .skill-name { width: 110px; flex-shrink: 0; font-size: 11px; color: var(--accent); }
+    .skill-body { flex: 1; font-size: 11px; color: var(--fg2); overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+    .skill-del  { font-size: 14px; color: var(--fg3); cursor: pointer; padding: 0 4px; line-height: 1; transition: color .15s; }
+    .skill-del:hover { color: var(--warn); }
+    .add-row { display: flex; gap: 6px; align-items: flex-start; }
+    #new-skill-name { width: 120px; flex-shrink: 0; }
+    #new-skill-body { flex: 1; }
+    textarea {
+      width: 100%; background: var(--bg2); border: 1px solid var(--border2);
+      border-radius: 3px; color: var(--fg); font-family: inherit; font-size: 12px;
+      padding: 7px 10px; outline: none; resize: vertical; min-height: 60px;
+      transition: border-color .15s;
+    }
+    textarea:focus { border-color: var(--accent); }
+    #no-skills-msg { font-size: 10px; color: var(--fg3); padding: 4px 0; }
+
+    /* Preset editor */
+    #presets-list { display: flex; flex-direction: column; gap: 8px; margin-bottom: 10px; }
+    .preset-row {
+      background: var(--bg2); border: 1px solid var(--border); border-radius: 3px;
+      padding: 8px 10px; transition: border-color .15s;
+    }
+    .preset-row:hover { border-color: var(--border2); }
+    .preset-header { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; }
+    .preset-name { font-size: 11px; color: var(--accent); flex: 1; }
+    .preset-reset { font-size: 9px; letter-spacing: .5px; padding: 2px 7px; }
+    .preset-del { font-size: 14px; color: var(--fg3); cursor: pointer; padding: 0 4px; line-height: 1; transition: color .15s; }
+    .preset-del:hover { color: var(--warn); }
+    .preset-body { width: 100%; min-height: 48px; font-size: 11px; }
+
+    /* Setup modal */
+    .setup-modal {
+      display: none;
+      position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+      background: rgba(12, 12, 14, 0.95);
+      z-index: 9999;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+    }
+    .setup-modal.active { display: flex; }
+    .setup-modal-content {
+      background: var(--bg2);
+      border: 1px solid var(--border2);
+      border-radius: 4px;
+      padding: 36px 40px;
+      max-width: 420px;
+      text-align: center;
+    }
+    .setup-modal h2 {
+      font-size: 16px; color: var(--accent);
+      margin-bottom: 12px; letter-spacing: 2px;
+    }
+    .setup-modal p {
+      font-size: 12px; color: var(--fg2); line-height: 1.8;
+      margin-bottom: 20px;
+    }
+    .setup-modal-btn {
+      width: 100%; background: rgba(77, 250, 154, 0.08);
+      border: 1px solid var(--accent2);
+      color: var(--accent); padding: 10px;
+      border-radius: 3px; font-family: inherit;
+      font-size: 12px; letter-spacing: 1px;
+      cursor: pointer; transition: all .15s;
+      margin-top: 8px;
+    }
+    .setup-modal-btn:hover { background: rgba(77, 250, 154, 0.14); }
+  </style>
+</head>
+<body>
+  <!-- Setup Modal -->
+  <div id="setup-modal" class="setup-modal">
+    <div class="setup-modal-content">
+      <h2 id="setup-title">SETUP REQUIRED</h2>
+      <p id="setup-text">Before using Pluck, please select a local folder where your conversation data will be saved.</p>
+      <p id="setup-text2" style="font-size:11px;color:#888;margin-top:14px"></p>
+      <button id="setup-pick-dir" class="setup-modal-btn">SELECT FOLDER</button>
+      <p id="setup-footer" style="font-size:10px;color:#555;margin-top:16px"></p>
+    </div>
+  </div>
+
+  <h1 id="page-title">PLUCK  SETTINGS</h1>
+
+  <div class="lang-switch">
+    <span class="lang-label" id="lang-label">LANGUAGE</span>
+    <button id="lang-en" class="lang-btn active">EN</button>
+    <button id="lang-zh" class="lang-btn">中文</button>
+  </div>
+
+  <p id="about-blurb" class="about-blurb"></p>
+
+  <div id="section-api" class="section-title">API</div>
+
+  <div class="field">
+    <label id="label-provider">LLM PROVIDER</label>
+    <select id="provider"></select>
+    <div id="hint-provider" class="hint">Choose which API provider Pluck should use for chat and trace requests.</div>
+  </div>
+
+  <div class="field">
+    <label id="apiKeyLabel">API KEY</label>
+    <div class="row">
+      <input type="password" id="apiKey" placeholder="sk-..." autocomplete="off" spellcheck="false"/>
+      <button id="toggleKey">SHOW</button>
+    </div>
+    <div id="api-key-hint" class="hint"></div>
+  </div>
+
+  <div class="field">
+    <label id="label-model">DEFAULT MODEL</label>
+    <select id="model">
+      <option value="gpt-4o-mini" selected>gpt-4o-mini  (fast, cheap)</option>
+      <option value="gpt-5-mini">gpt-5-mini  (latest fast)</option>
+      <option value="gpt-4o">gpt-4o  (balanced)</option>
+    </select>
+    <div id="hint-model" class="hint">Can also be cycled in the overlay with the model badge.</div>
+  </div>
+
+  <button id="save" class="primary">SAVE SETTINGS</button>
+  <div id="status"></div>
+
+  <div id="section-skills" class="section-title">USER SKILLS (/ commands)</div>
+  <div id="hint-skills" class="hint" style="margin-bottom:10px">Type <code>/name</code> in the sidebar input to expand a skill prompt.</div>
+  <div id="skills-list"></div>
+  <div class="add-row">
+    <input type="text" id="new-skill-name" placeholder="skill-name" spellcheck="false"/>
+    <textarea id="new-skill-body" placeholder="Prompt text for this skill..." spellcheck="false"></textarea>
+    <button id="add-skill">ADD</button>
+  </div>
+
+  <div id="section-presets" class="section-title">PRESETS  (/ commands)</div>
+  <div id="hint-presets" class="hint" style="margin-bottom:10px">Edit the built-in <code>/cmd</code> instructions, or add your own. Changes are saved to your data export for easy migration.</div>
+  <div id="presets-list"></div>
+  <div class="add-row" style="margin-bottom:8px">
+    <input type="text" id="new-preset-name" placeholder="preset-name" spellcheck="false" style="width:130px;flex-shrink:0"/>
+    <textarea id="new-preset-body" class="preset-body" placeholder="Instruction text for this preset…" spellcheck="false"></textarea>
+    <button id="add-preset">ADD</button>
+  </div>
+  <div class="row" style="gap:10px">
+    <button id="save-presets" class="primary">SAVE PRESETS</button>
+    <button id="reset-presets">RESET DEFAULTS</button>
+    <div id="presets-status" style="font-size:11px;color:var(--accent);letter-spacing:1px;height:18px;line-height:18px"></div>
+  </div>
+
+  <div id="section-data" class="section-title">DATA  &amp;  PRIVACY</div>
+  <div id="hint-data" class="hint" style="margin-bottom:12px">All data is stored locally. Nothing is uploaded unless <em>you</em> send a message. Export or import a full snapshot at any time.</div>
+
+  <div class="field">
+    <label id="label-sync-folder">LOCAL SYNC FOLDER</label>
+    <div class="row">
+      <input type="text" id="sync-dir-path" placeholder="no folder selected" readonly style="cursor:pointer;color:#555"/>
+      <button id="pick-dir">PICK FOLDER</button>
+    </div>
+    <div id="hint-sync-folder" class="hint">If set, Pluck will write <code style="color:#667;font-size:10px">pluck_data.json</code> to this folder whenever history or context changes.</div>
+  </div>
+
+  <div class="row" style="gap:10px;margin-top:4px">
+    <button id="export-json" class="primary">EXPORT JSON</button>
+    <button id="import-json">IMPORT JSON</button>
+    <input type="file" id="import-file" accept=".json" style="display:none"/>
+  </div>
+  <div id="data-status" style="font-size:11px;color:#4dfa9a;letter-spacing:1px;height:18px;margin-top:8px"></div>
+
+  <script src="i18n.js"></script>
+  <script src="providers.js"></script>
+  <script src="options.js"></script>
+</body>
+</html>

@@ -1,0 +1,14 @@
+{
+  "presets": {
+    "sum":       "Summarize the selected text into bare key points. No formatting, no filler. Match the language of the user prompt; if absent, match the selected text's language.",
+    "extract":   "Extract all key data points, numbers, and facts from the selected text into a minimal list. No commentary.",
+    "explain":   "Explain what this page or selected content is about in plain language. Be concise.",
+    "translate": "Detect the language of the selected text and translate it to English. If the user specifies a target language in their prompt, translate there instead. Output translation only.",
+    "rephrase":  "Give 3–5 alternative phrasings of the selected text. Cover: simpler, more formal, more concise, casual. Label each variant with one word. No explanations.",
+    "grammar":   "List only the grammatical errors in the selected text. Format each as: [original] → [correction]. No other output.",
+    "keywords":  "Generate precise search keyword candidates from the selected text to expand information retrieval. Include exact phrases, synonyms, and related terms. Compact list only.",
+    "find":      "The user's prompt is a fuzzy description of something. Search the selected text for matching information. Return direct quotes only so the user can Ctrl+F to locate them. If nothing matches, output: not found.",
+    "define":    "Define the selected term or concept in 1–3 sentences. Precise and direct, no padding.",
+    "outline":   "Convert the selected content into a hierarchical outline. Minimal words per node. No prose."
+  }
+}
