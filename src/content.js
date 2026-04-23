@@ -136,7 +136,9 @@
     if (!captured) return;
 
     if (S.copyMode) {
-      navigator.clipboard.writeText(captured.text).catch(err => ERR('copy failed', err));
+      const textWithUrl = captured.text + '\n\n[Source: ' + location.href + ']';
+      navigator.clipboard.writeText(textWithUrl).catch(err => ERR('copy failed', err));
+      showSelToast('Copied with URL', false);
       exitCopyMode();
       return;
     }

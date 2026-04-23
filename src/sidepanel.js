@@ -265,6 +265,12 @@ async function init() {
         });
       }
       if (changes.cwaDisplayDays) { S.displayDays = changes.cwaDisplayDays.newValue || 7; refreshList(); }
+      if (changes.cwaPresets) {
+        S.presets = Object.assign({}, DEFAULT_PRESETS, changes.cwaPresets.newValue || {});
+        LOG('presets updated from sync:', Object.keys(S.presets).join(', '));
+        // Sync to pluck_data.json if dir handle is available
+        syncToDir().catch(() => {});
+      }
     }
   });
 
@@ -579,15 +585,17 @@ function checkInputHint() {
         item.dataset.ctxId = id;
         const isOwn = ctx.url === S.currentUrl;
         const preview = ctx.text.slice(0, 40) + (ctx.text.length > 40 ? '\u2026' : '');
+        const title = ctx.title ? esc(ctx.title.slice(0, 30)) + (ctx.title.length > 30 ? '…' : '') : 'no title';
         item.innerHTML =
           '<span class="at-hint-idx" style="color:' + (isOwn ? 'var(--accent)' : '#8888ff') + '">@' + id + '</span>' +
-          '<span class="at-hint-text">' + esc(preview) + '</span>';
+          '<span class="at-hint-text">' + title + ' <span style="color:var(--fg-dim)">—</span> ' + esc(preview) + '</span>';
         // Hover: expand preview
         item.addEventListener('mouseover', () => {
-          item.querySelector('.at-hint-text').textContent = ctx.text.slice(0, 120) + (ctx.text.length > 120 ? '\u2026' : '');
+          const expandedPreview = ctx.text.slice(0, 120) + (ctx.text.length > 120 ? '\u2026' : '');
+          item.querySelector('.at-hint-text').innerHTML = title + ' <span style="color:var(--fg-dim)">—</span> ' + esc(expandedPreview);
         });
         item.addEventListener('mouseleave', () => {
-          item.querySelector('.at-hint-text').textContent = preview;
+          item.querySelector('.at-hint-text').innerHTML = title + ' <span style="color:var(--fg-dim)">—</span> ' + esc(preview);
         });
         item.addEventListener('mousedown', e => {
           e.preventDefault();
@@ -644,9 +652,10 @@ function runCtxSearch(atM, val, pos) {
     item.className = 'at-hint-item' + (i === 0 ? ' active' : '');
     item.dataset.ctxId = id;
     const preview = ctx.text.slice(0, 60) + (ctx.text.length > 60 ? '\u2026' : '');
+    const title = ctx.title ? esc(ctx.title.slice(0, 30)) + (ctx.title.length > 30 ? '…' : '') : 'no title';
     item.innerHTML =
       '<span class="at-hint-idx" style="color:#8888ff">@' + id + '</span>' +
-      '<span class="at-hint-text">' + esc(preview) + '</span>';
+      '<span class="at-hint-text">' + title + ' <span style="color:var(--fg-dim)">—</span> ' + esc(preview) + '</span>';
     item.addEventListener('mousedown', e => {
       e.preventDefault();
       insertCtxRef(id, atM, val, pos);
@@ -972,7 +981,7 @@ async function syncToDir() {
 
     // Build snapshot matching options.js buildSnapshot format
     const local = await new Promise(r => chrome.storage.local.get(['cwaHistory', 'cwaCtxStore'], r));
-    const sync  = await new Promise(r => chrome.storage.sync.get(['cwaProvider', 'cwaApiKeys', 'cwaModel', 'cwaDisplayDays', 'userSkills'], r));
+    const sync  = await new Promise(r => chrome.storage.sync.get(['cwaProvider', 'cwaApiKeys', 'cwaModel', 'cwaDisplayDays', 'userSkills', 'cwaPresets'], r));
     const snapshot = {
       version:    2,
       exportedAt: new Date().toISOString(),
@@ -984,6 +993,7 @@ async function syncToDir() {
         model: sync.cwaModel,
         displayDays: sync.cwaDisplayDays,
         userSkills: sync.userSkills,
+        presets: sync.cwaPresets,
       },
     };
 

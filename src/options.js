@@ -331,7 +331,10 @@ function renderPresets() {
     del.addEventListener('click', (function(n) {
       return function() {
         delete presets[n];
-        renderPresets();
+        // Save immediately to chrome.storage.sync
+        chrome.storage.sync.set({ cwaPresets: presets }, function() {
+          renderPresets();
+        });
       };
     })(name));
     actions.appendChild(del);
@@ -344,7 +347,11 @@ function renderPresets() {
     ta.value = presets[name];
     ta.spellcheck = false;
     ta.addEventListener('input', (function(n, t) {
-      return function() { presets[n] = t.value; };
+      return function() {
+        presets[n] = t.value;
+        // Save immediately to chrome.storage.sync
+        chrome.storage.sync.set({ cwaPresets: presets });
+      };
     })(name, ta));
 
     if (row._resetBtn) {
@@ -352,6 +359,8 @@ function renderPresets() {
         return function() {
           t.value = DEFAULT_PRESETS[n];
           presets[n] = DEFAULT_PRESETS[n];
+          // Save immediately to chrome.storage.sync
+          chrome.storage.sync.set({ cwaPresets: presets });
         };
       })(name, ta));
     }
@@ -384,7 +393,15 @@ document.getElementById('add-preset').addEventListener('click', function() {
   presets[name] = body;
   document.getElementById('new-preset-name').value = '';
   document.getElementById('new-preset-body').value = '';
-  renderPresets();
+  // Save immediately to chrome.storage.sync and pluck_data.json
+  chrome.storage.sync.set({ cwaPresets: presets }, function() {
+    renderPresets();
+    if (_dirHandle) {
+      buildSnapshot(function(snapshot) {
+        writeToDir(snapshot);
+      });
+    }
+  });
 });
 
 // ── Data section: Export / Import / Directory picker ──────────────────────────
@@ -405,6 +422,12 @@ function saveDirHandle(handle) {
     var db = e.target.result;
     var tx = db.transaction('kv', 'readwrite');
     tx.objectStore('kv').put(handle, 'dirHandle');
+    // After saving dir handle, immediately sync current data to pluck_data.json
+    setTimeout(function() {
+      buildSnapshot(function(snapshot) {
+        writeToDir(snapshot);
+      });
+    }, 100);
   };
 }
 
