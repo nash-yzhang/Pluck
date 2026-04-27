@@ -8,7 +8,7 @@
 
 ## What it does
 
-Pluck adds a lightweight AI chat sidebar to Chrome. Activate the overlay with **Alt+1**, click or drag-select content on the page, type your question — the answer streams back instantly in the sidebar while you stay on the same tab.
+Pluck adds a lightweight AI chat sidebar to Chrome. Activate the overlay with **Alt+K**, click an element on the page, type your question — the answer streams back instantly in the sidebar while you stay on the same tab. **This plugin has only been tested on Win 11 + chrome.**
 
 Every API call goes **directly from your browser** to the LLM provider you choose. Nothing passes through an external server or proxy.
 
@@ -25,7 +25,7 @@ Every API call goes **directly from your browser** to the LLM provider you choos
    - *Chrome Web Store:* install directly (link above)
    - *From source:* open `chrome://extensions` → enable **Developer mode** → **Load unpacked** → select the `extension/` folder
 
-3. **Enter your API key**
+3. **Enter your API key** 
    - Click the Pluck toolbar icon → **OPEN SETTINGS**
    - Choose your provider, paste the key, pick a default model → **SAVE SETTINGS**
 
@@ -37,9 +37,9 @@ Every API call goes **directly from your browser** to the LLM provider you choos
 
 | Shortcut | Action |
 |---|---|
-| `Alt+1` | Enter visual selection mode (toggle) |
-| `Alt+`` | Toggle the overlay on/off |
-| `Esc` | Close overlay / cancel |
+| `Alt+1` | Enter visual selection mode (also toggle sidebar) |
+| `Alt+2` | Copy selection text to clipboard  |
+| `Alt+K` | Toggle the sidebar on/off |
 
 ### Selecting content
 
@@ -47,30 +47,28 @@ Every API call goes **directly from your browser** to the LLM provider you choos
 |---|---|
 | Click an element | Captures the full text of that element |
 | Drag to select text | Captures selected text as **Key**, parent element as **Context** |
-| `Shift` + click or drag | Appends to existing selections |
-| Hover a selection → copy icon | Copy selection text to clipboard |
-| **CLEAR ALL** | Remove all selections |
 
 The sidebar sends **Key** (what you focused on) and **Context** (the surrounding element) so the model understands the full picture without receiving unnecessary HTML.
 
-### Presets — type `@name` in the input
+### Presets — type `/name` in the input
 
 | Preset | What it does |
 |---|---|
-| `@sum` | Summarise into bare key points |
-| `@extract` | Extract all data points and facts |
-| `@explain` | Explain in plain language |
-| `@translate` | Translate to English (or specify target language) |
-| `@rephrase` | 3–5 alternative phrasings |
-| `@grammar` | List grammatical errors with corrections |
-| `@keywords` | Generate search keyword candidates |
-| `@find` | Fuzzy-search for something in the selected text |
-| `@define` | Define a term or concept |
-| `@outline` | Convert content to a hierarchical outline |
+| `/sum` | Summarise into bare key points |
+| `/extract` | Extract all data points and facts |
+| `/explain` | Explain in plain language |
+| `/translate` | Translate to English (or specify target language) |
+| `/rephrase` | 3–5 alternative phrasings |
+| `/grammar` | List grammatical errors with corrections |
+| `/keywords` | Generate search keyword candidates |
+| `/find` | Fuzzy-search for something in the selected text |
+| `/define` | Define a term or concept |
+| `/outline` | Convert content to a hierarchical outline |
 
-### Custom skills — type `/name` in the input
+- You can add your own preset in the setting page
 
-Define your own prompt shortcuts in Settings (⚙ button). Any `/name` you register expands to its full prompt before the query is sent.
+### Context adding and searching
+- Typing "@" to trigger context autocompletion ui. Search bar at the bottom of the UI (you may have to scroll down)
 
 ### Model cycling
 
@@ -106,37 +104,6 @@ Full policy: [privacy.html](privacy.html)
 Remove from `chrome://extensions`. No registry entries or native hosts to clean up.
 
 ---
-
-## For developers
-
-### Project structure
-
-```
-extension/
-  background.js      — MV3 service worker; LLM API relay
-  providers.js       — Provider config (endpoints, models, key format)
-  content.js         — Selection overlay injected into pages
-  sidepanel.js/html  — Main AI chat sidebar
-  options.js/html    — Settings page
-  popup.js/html      — Toolbar popup (status display)
-  pdf-extract.js     — PDF text extraction helper
-  config.json        — Built-in preset definitions
-  icons/             — Extension icons (16, 32, 48, 128 px)
-```
-
-### Adding a new provider
-
-1. Add an entry to `CWA_PROVIDER_CONFIG` in `extension/providers.js`
-2. If the provider uses the OpenAI-compatible chat completions format, set `requestType: 'openai-compatible'`; otherwise implement a streaming handler in `background.js` alongside `streamAnthropic()`
-3. Add the API endpoint to `host_permissions` in `manifest.json`
-
-### Build / package
-
-```powershell
-Compress-Archive -Path extension\* -DestinationPath pluck-2.0.0.zip -Force
-```
-
-Upload `pluck-2.0.0.zip` to the [Chrome Web Store Developer Dashboard](https://chrome.google.com/webstore/devconsole).
 
 ### CWS permission justifications
 
