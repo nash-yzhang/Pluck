@@ -1,4 +1,3 @@
-var skills = {};
 var providerApiKeys = {};
 var providerModels = {};
 var presets = {};
@@ -40,12 +39,6 @@ function applyI18n(lang, rerender) {
   $('toggleKey').textContent       = $('apiKey').type === 'password' ? _t.showKey : _t.hideKey;
   $('save').textContent            = _t.saveBtn;
 
-  $('section-skills').textContent  = _t.sectionSkills;
-  $('hint-skills').textContent     = _t.hintSkills;
-  $('new-skill-name').placeholder  = _t.skillNamePh;
-  $('new-skill-body').placeholder  = _t.skillBodyPh;
-  $('add-skill').textContent       = _t.addBtn;
-
   $('section-presets').textContent   = _t.sectionPresets;
   $('hint-presets').textContent      = _t.hintPresets;
   $('new-preset-name').placeholder   = _t.presetNamePh;
@@ -70,7 +63,6 @@ function applyI18n(lang, rerender) {
   $('setup-footer').innerHTML   = _t.setupFooter + '<br>' + _t.setupFooter2;
 
   if (rerender) {
-    renderSkills();
     renderPresets();
   }
 }
@@ -159,7 +151,7 @@ function renderProviderFields(provider, apiKeys, selectedModel) {
 // ── Load saved settings ────────────────────────────────────────────────────────
 populateProviderOptions();
 
-chrome.storage.sync.get(['cwaApiKey', 'cwaApiKeys', 'cwaProvider', 'cwaModel', 'userSkills', 'cwaLanguage'], function(r) {
+chrome.storage.sync.get(['cwaApiKey', 'cwaApiKeys', 'cwaProvider', 'cwaModel', 'cwaLanguage'], function(r) {
   // Apply language first so all renders use correct strings
   applyI18n(r.cwaLanguage || 'en', false);
 
@@ -174,8 +166,6 @@ chrome.storage.sync.get(['cwaApiKey', 'cwaApiKeys', 'cwaProvider', 'cwaModel', '
   document.getElementById('provider').value = normalized.provider;
   document.getElementById('provider').setAttribute('data-prev-provider', normalized.provider);
   renderProviderFields(normalized.provider, normalized.apiKeys, normalized.model);
-  skills = r.userSkills || {};
-  renderSkills();
 });
 
 chrome.storage.sync.get(['cwaPresets'], function(r) {
@@ -235,52 +225,6 @@ document.getElementById('save').addEventListener('click', function() {
     var st = document.getElementById('status');
     st.textContent = _t.savedStatus;
     setTimeout(function() { st.textContent = ''; }, 2000);
-  });
-});
-
-// ── Skills ─────────────────────────────────────────────────────────────────────
-function renderSkills() {
-  var list = document.getElementById('skills-list');
-  list.innerHTML = '';
-  var keys = Object.keys(skills);
-  if (keys.length === 0) {
-    list.innerHTML = '<div style="font-size:11px;color:#555;padding:4px 0">' + (_t.noSkillsMsg || 'No skills saved yet.') + '</div>';
-    return;
-  }
-  keys.forEach(function(name) {
-    var row  = document.createElement('div');
-    row.className = 'skill-row';
-    var nm   = document.createElement('span');
-    nm.className = 'skill-name';
-    nm.textContent = '/' + name;
-    var body = document.createElement('span');
-    body.className = 'skill-body';
-    body.textContent = skills[name];
-    body.title = skills[name];
-    var del  = document.createElement('span');
-    del.className = 'skill-del';
-    del.textContent = '×';
-    del.title = _t.presetDelTitle || 'Delete';
-    del.addEventListener('click', (function(n) {
-      return function() {
-        delete skills[n];
-        chrome.storage.sync.set({ userSkills: skills }, renderSkills);
-      };
-    })(name));
-    row.appendChild(nm); row.appendChild(body); row.appendChild(del);
-    list.appendChild(row);
-  });
-}
-
-document.getElementById('add-skill').addEventListener('click', function() {
-  var name = document.getElementById('new-skill-name').value.trim().replace(/\s+/g, '-');
-  var body = document.getElementById('new-skill-body').value.trim();
-  if (!name || !body) return;
-  skills[name] = body;
-  chrome.storage.sync.set({ userSkills: skills }, function() {
-    document.getElementById('new-skill-name').value = '';
-    document.getElementById('new-skill-body').value = '';
-    renderSkills();
   });
 });
 
@@ -443,7 +387,7 @@ document.getElementById('pick-dir').addEventListener('click', async function() {
 
 function buildSnapshot(cb) {
   chrome.storage.local.get(['cwaHistory', 'cwaCtxStore'], function(local) {
-    chrome.storage.sync.get(['cwaProvider', 'cwaApiKeys', 'cwaModel', 'cwaDisplayDays', 'userSkills', 'cwaPresets'], function(sync) {
+    chrome.storage.sync.get(['cwaProvider', 'cwaApiKeys', 'cwaModel', 'cwaDisplayDays', 'cwaPresets'], function(sync) {
       cb({
         version: 2,
         exportedAt: new Date().toISOString(),
@@ -454,7 +398,6 @@ function buildSnapshot(cb) {
           apiKeys: sync.cwaApiKeys,
           model: sync.cwaModel,
           displayDays: sync.cwaDisplayDays,
-          userSkills: sync.userSkills,
           presets: sync.cwaPresets,
         },
       });
@@ -510,7 +453,6 @@ document.getElementById('import-file').addEventListener('change', function(e) {
           if (data.settings.apiKeys)     syncSet.cwaApiKeys     = data.settings.apiKeys;
           if (data.settings.model)       syncSet.cwaModel       = data.settings.model;
           if (data.settings.displayDays) syncSet.cwaDisplayDays = data.settings.displayDays;
-          if (data.settings.userSkills)  syncSet.userSkills  = data.settings.userSkills;
           if (data.settings.presets)     syncSet.cwaPresets  = data.settings.presets;
           chrome.storage.sync.set(syncSet, function() {
             if (data.settings.presets) {

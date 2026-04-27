@@ -131,7 +131,7 @@ async function init() {
   chrome.storage.session.set({ cwaSpOpen: true });
   window.addEventListener('pagehide', () => chrome.storage.session.set({ cwaSpOpen: false }));
 
-  const sync = await chromeSGet(['cwaApiKey', 'cwaApiKeys', 'cwaProvider', 'cwaModel', 'cwaDisplayDays', 'userSkills', 'cwaPresets']);
+  const sync = await chromeSGet(['cwaApiKey', 'cwaApiKeys', 'cwaProvider', 'cwaModel', 'cwaDisplayDays', 'cwaPresets']);
   const normalized = cwaNormalizeSettings({
     provider: sync.cwaProvider,
     model: sync.cwaModel,
@@ -143,8 +143,7 @@ async function init() {
   S.displayDays = sync.cwaDisplayDays || 7;
   syncModelBadges();
 
-  // Merge: built-in defaults → user-edited presets → user skills
-  S.presets = Object.assign({}, DEFAULT_PRESETS, sync.cwaPresets || {}, sync.userSkills || {});
+  S.presets = Object.assign({}, DEFAULT_PRESETS, sync.cwaPresets || {});
   LOG('presets loaded:', Object.keys(S.presets).join(', '));
 
   // Clone status bar into chat view
@@ -831,23 +830,31 @@ function renderEntries() {
         renderEntries();
         return;
       }
-      // Plain click — clear selection, then toggle expand
+      // Plain click — clear selection (update classes in-place, no DOM rebuild)
       if (S.selectedUrls.size) {
         S.selectedUrls.clear();
-        renderEntries();
+        el.entriesList.querySelectorAll('.entry.selected').forEach(el => el.classList.remove('selected'));
         return;
       }
     });
 
     // Double-click: switch to that tab or open new tab
-    wrap.addEventListener('dblclick', e => {
+    head.addEventListener('dblclick', e => {
       e.stopPropagation();
+      LOG('DEBUG dblclick: entry.url=', entry.url);
       chrome.tabs.query({}, tabs => {
-        const existing = tabs.find(t => normalizeUrl(t.url || '') === entry.url);
+        LOG('DEBUG dblclick: tabs count=', tabs.length, 'checking against entry.url=', entry.url);
+        const existing = tabs.find(t => {
+          const norm = normalizeUrl(t.url || '');
+          LOG('DEBUG dblclick tab:', norm, '===', entry.url, '?', norm === entry.url);
+          return norm === entry.url;
+        });
         if (existing) {
+          LOG('DEBUG dblclick: found existing tab id=', existing.id, 'windowId=', existing.windowId);
           chrome.tabs.update(existing.id, { active: true });
           chrome.windows.update(existing.windowId, { focused: true });
         } else {
+          LOG('DEBUG dblclick: no existing tab found, creating new tab for', entry.url);
           chrome.tabs.create({ url: entry.url, active: true });
         }
       });
@@ -981,7 +988,7 @@ async function syncToDir() {
 
     // Build snapshot matching options.js buildSnapshot format
     const local = await new Promise(r => chrome.storage.local.get(['cwaHistory', 'cwaCtxStore'], r));
-    const sync  = await new Promise(r => chrome.storage.sync.get(['cwaProvider', 'cwaApiKeys', 'cwaModel', 'cwaDisplayDays', 'userSkills', 'cwaPresets'], r));
+    const sync  = await new Promise(r => chrome.storage.sync.get(['cwaProvider', 'cwaApiKeys', 'cwaModel', 'cwaDisplayDays', 'cwaPresets'], r));
     const snapshot = {
       version:    2,
       exportedAt: new Date().toISOString(),
@@ -992,7 +999,6 @@ async function syncToDir() {
         apiKeys: sync.cwaApiKeys,
         model: sync.cwaModel,
         displayDays: sync.cwaDisplayDays,
-        userSkills: sync.userSkills,
         presets: sync.cwaPresets,
       },
     };
@@ -1482,6 +1488,21 @@ async function sendChatMessage() {
         attachTraceButton(aiDiv, reply, traceSrcs);
         el.chatMessages.scrollTop = el.chatMessages.scrollHeight;
         if (snapshotSels.length > 0) S.lastCtxSels = snapshotSels.slice();
+        // Update S.currentEntry immediately so subsequent messages use fresh history
+        const newMsgPair = [
+          { timestamp: Date.now(), role: 'user', message: text, context: snapshotSels.map(s => s.text).filter(Boolean).join(' | ') },
+          { timestamp: Date.now() + 1, role: 'assistant', message: reply, context: '', contextRefs: traceSrcs.map((ts, i) => ({ id: snapshotSels[i] ? snapshotSels[i].id : undefined, text: snapshotSels[i] ? snapshotSels[i].text : ts.text, context: snapshotSels[i] ? snapshotSels[i].context : ts.text, url: ts.url, title: ts.title })) },
+        ];
+        if (S.currentEntry) {
+          if (!S.currentEntry.content) S.currentEntry.content = [];
+          S.currentEntry.content.push(...newMsgPair);
+          LOG('DEBUG sendChat: updated S.currentEntry.content length=', S.currentEntry.content.length);
+        } else {
+          S.currentEntry = { url: payload.url, title: S.currentTitle || payload.url, context: [], content: newMsgPair };
+          LOG('DEBUG sendChat: created new S.currentEntry for url=', payload.url);
+        }
+        // Suppress onHistoryChanged re-render: DOM and S.currentEntry are already updated locally
+        S.suppressHistoryRender = true;
         chrome.runtime.sendMessage({
           type: 'HISTORY_SAVE',
           payload: {
@@ -1498,7 +1519,7 @@ async function sendChatMessage() {
               title:   ts.title,
             })),
           },
-        }).catch(() => {});
+        }, () => { S.suppressHistoryRender = false; syncToDir().catch(() => {}); });
         resolve();
       });
       port.onDisconnect.addListener(() => {
