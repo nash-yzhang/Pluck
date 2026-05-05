@@ -25,10 +25,12 @@ const DEFAULT_PRESETS = {
   find:      'Search the page content for passages matching the user\'s description or keyword. Return ONLY verbatim quotes in double quotes — these will be auto-highlighted on the page. If nothing matches, output: not found.',
   define:    'Define the selected term or concept in 1–3 sentences. Precise and direct, no padding.',
   outline:   'Convert the selected content into a hierarchical outline. Minimal words per node. No prose.',
+  search:    'Search the web for the user\'s query. Output your best concise answer in 2–4 sentences, then include exactly one [SEARCH: optimized_search_query] tag at the end — the query should be precise and in English regardless of input language.',
 };
 
 const S = {
   view:              'list',
+  scrollPositions:   {},   // { [url]: scrollTop } — persisted across tab switches
   currentEntry:      null,
   currentUrl:        '',
   currentTitle:      '',
@@ -47,6 +49,7 @@ const S = {
   lastCtxSels:            [],   // last-used context selections (persisted across Q&As)
   suppressHistoryRender:  false, // true while TRACE_SAVE is in flight
   autoCtxId:         null,  // ID of auto-captured full-page ctx for current URL
+  currentPort:       null,  // active chrome.runtime port; set during streaming for abort
   ctxNextId:         1,    // global monotone context ID counter
   pageHtmlCache:     {},   // { [url]: { uid, text, title, createdAt } } — session-level page text cache
   resumeCache:       {},   // { [url]: string } — LLM session resume summaries (persisted)
@@ -213,16 +216,15 @@ async function init() {
     }
   });
 
-  el.chatSend.addEventListener('click', sendChatMessage);
-
-  // Web search pill click — triggered by [SEARCH: ...] links in AI replies
-  el.chatMessages.addEventListener('click', e => {
-    const link = e.target.closest('a.search-link[data-search-query]');
-    if (!link) return;
-    e.preventDefault();
-    const query = link.dataset.searchQuery;
-    if (query) triggerWebSearch(query, link);
+  el.chatSend.addEventListener('click', () => {
+    if (S.chatBusy) { abortCurrentStream(); return; }
+    sendChatMessage();
   });
+
+  // Save scroll position per URL so it survives tab switches (e.g. citation clicks)
+  el.chatMessages.addEventListener('scroll', () => {
+    if (S.currentUrl) S.scrollPositions[S.currentUrl] = el.chatMessages.scrollTop;
+  }, { passive: true });
   el.chatInp.addEventListener('keydown', e => {
     // hint dropdown keyboard nav
     if (el.atHint.style.display !== 'none' && S.hintItems.length) {
@@ -1219,12 +1221,19 @@ function openChatView(entry) {
 
   renderCtxBar();
   renderChatMessages(entry.content || []);
+  // Restore saved scroll position if not at bottom (e.g. after citation tab jump)
+  const savedScroll = S.scrollPositions[entry.url];
+  if (savedScroll !== undefined) {
+    // Only restore if user had scrolled away from bottom (>100px)
+    const atBottom = savedScroll >= el.chatMessages.scrollHeight - el.chatMessages.clientHeight - 100;
+    if (!atBottom) el.chatMessages.scrollTop = savedScroll;
+  }
   setTimeout(() => el.chatInp.focus(), 50);
 }
 
 function renderChatMessages(content) {
   LOG('renderChatMessages: content.length=', content.length,
-      '| caller=', new Error().stack.split('\n')[2].trim().slice(0, 80));
+      '| caller=', (new Error().stack.split('\n')[2] || '').trim().slice(0, 80));
   el.chatMessages.innerHTML = '';
   if (!content.length) {
     el.chatMessages.innerHTML = '<div class="msg sys">NEW CONVERSATION \u2014 type below to start</div>';
@@ -1549,21 +1558,46 @@ function injectSuperscript(container, claim, num, evidence, src) {
   return false;
 }
 
-// ── Web search triggered by [SEARCH: ...] pill ────────────────────────────
+// ── Web search triggered by [SEARCH: ...] — async, saves to history ─────────
 function triggerWebSearch(query, linkEl) {
-  linkEl.textContent = '\u23f3 searching\u2026';
-  linkEl.style.opacity = '0.6';
-  linkEl.style.pointerEvents = 'none';
+  if (linkEl) {
+    linkEl.textContent = '\u23f3 searching\u2026';
+    linkEl.style.opacity = '0.6';
+    linkEl.style.pointerEvents = 'none';
+  }
   chrome.runtime.sendMessage({ type: 'WEB_SEARCH', payload: { query } }, result => {
-    linkEl.style.pointerEvents = '';
-    linkEl.style.opacity = '1';
-    if (!result || result.error) {
-      linkEl.textContent = '\u26a0 ' + (result && result.error ? result.error : 'search failed');
-      linkEl.style.color = '#cc3322';
-      return;
+    if (linkEl) {
+      linkEl.style.pointerEvents = '';
+      linkEl.style.opacity = '1';
+      if (!result || result.error) {
+        linkEl.textContent = '\u26a0 ' + (result && result.error ? result.error : 'search failed');
+        linkEl.style.color = '#cc3322';
+      } else {
+        linkEl.textContent = '\u2713 ' + query;
+      }
     }
-    linkEl.textContent = '\u2713 ' + query;
+    if (!result || result.error) return;
     appendSearchResult(result.summary || '', result.sources || [], result.query || query);
+    // Save search result to history as a normal assistant message
+    const searchText = '\uD83D\uDD0D ' + (result.query || query) + '\n\n' + (result.summary || '');
+    const now = Date.now();
+    const searchMsg = { timestamp: now, role: 'assistant', message: searchText, context: '', isSearchResult: true };
+    if (S.currentEntry) {
+      if (!S.currentEntry.content) S.currentEntry.content = [];
+      S.currentEntry.content.push(searchMsg);
+    }
+    S.suppressHistoryRender = true;
+    chrome.runtime.sendMessage({
+      type: 'HISTORY_SAVE',
+      payload: {
+        url:         S.currentUrl,
+        title:       S.currentTitle || S.currentUrl,
+        userMessage: '',
+        aiReply:     searchText,
+        contextTexts: [],
+        contextRefs:  [],
+      },
+    }, () => { S.suppressHistoryRender = false; syncToDir().catch(() => {}); });
   });
 }
 
@@ -1641,7 +1675,7 @@ function appendSearchResult(summary, sources, query) {
 
 function backToList() {
   LOG('backToList called; S.view=', S.view, '| floatHandoffBusy=', !!S.floatHandoffBusy,
-      '| caller=', new Error().stack.split('\n')[2].trim().slice(0, 80));
+      '| caller=', (new Error().stack.split('\n')[2] || '').trim().slice(0, 80));
   S.selectedUrls.clear();
   document.body.className = '';
   showListView();
@@ -1707,7 +1741,8 @@ async function sendChatMessage() {
   el.chatInp.style.height = '';
   updateMirror();
   el.chatInp.disabled = true;
-  el.chatSend.disabled = true;
+  el.chatSend.textContent = '\u25a0';
+  el.chatSend.title = 'Stop (click to abort)';
 
   // Phase 0-C: use resume summary to trim history when available
   const resumeSummary = S.resumeCache[S.currentUrl] || null;
@@ -1763,6 +1798,7 @@ async function sendChatMessage() {
     setStatus('waiting');
     await new Promise((resolve, reject) => {
       const port = chrome.runtime.connect({ name: 'cwa' });
+      S.currentPort = port;
       port.onMessage.addListener(msg => {
         if (msg.type === 'CHUNK') {
           buf += msg.chunk;
@@ -1776,6 +1812,17 @@ async function sendChatMessage() {
         const reply = msg.reply || buf;
         aiDiv._content.innerHTML = renderMarkdown(reply);
         aiDiv.classList.remove('streaming');
+        // Auto-trigger any [SEARCH: ...] pills present in the response (async, background)
+        aiDiv._content.querySelectorAll('a.search-link[data-search-query]').forEach(link => {
+          if (link.dataset.autoTriggered) return;
+          link.dataset.autoTriggered = '1';
+          triggerWebSearch(link.dataset.searchQuery, link);
+        });
+        // For /search preset: remove pill markup from displayed reply (search runs in background)
+        if (presetKey === 'search') {
+          const cleaned = (aiDiv._content.innerHTML || '').replace(/<a[^>]+class="search-link"[^>]*>[^<]*<\/a>/g, '').trim();
+          if (cleaned !== aiDiv._content.innerHTML) aiDiv._content.innerHTML = cleaned;
+        }
         // Super Ctrl+F: auto-highlight quoted matches returned by /find
         if (presetKey === 'find' && reply) {
           const quotes = [];
@@ -1842,9 +1889,18 @@ async function sendChatMessage() {
     setStatus('error');
   } finally {
     S.chatBusy = false;
+    S.currentPort = null;
     el.chatInp.disabled = false;
-    el.chatSend.disabled = false;
+    el.chatSend.textContent = '\u25b6';
+    el.chatSend.title = 'Send (Enter)';
     el.chatInp.focus();
+  }
+}
+
+function abortCurrentStream() {
+  if (S.currentPort) {
+    try { S.currentPort.disconnect(); } catch(_) {}
+    S.currentPort = null;
   }
 }
 

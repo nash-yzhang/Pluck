@@ -577,35 +577,35 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
       const { apiKey, model, provider } = await getConfig();
       if (!apiKey) { respond({ error: 'No LLM API key set.' }); return; }
       const { query } = msg.payload;
-      const searchCfg = await new Promise(r => chrome.storage.sync.get(['cwaSearchApiKey', 'cwaSearchProvider'], r));
-      const searchKey      = (searchCfg.cwaSearchApiKey || '').trim();
-      const searchProvider = searchCfg.cwaSearchProvider || 'brave';
-      if (!searchKey) { respond({ error: 'No Search API key configured. Add one in Settings → Search API.' }); return; }
       try {
-        let results = [];
-        if (searchProvider === 'brave') {
-          const r = await fetch(
-            'https://api.search.brave.com/res/v1/web/search?q=' + encodeURIComponent(query) + '&count=6&text_decorations=0',
-            { headers: { 'Accept': 'application/json', 'Accept-Encoding': 'gzip', 'X-Subscription-Token': searchKey } }
-          );
-          if (!r.ok) throw new Error('Brave Search error ' + r.status + ': ' + await r.text().then(t => t.slice(0,200)));
-          const data = await r.json();
-          results = ((data.web && data.web.results) || []).slice(0, 6).map(item => ({
-            title: item.title || '', url: item.url || '', snippet: item.description || '',
-          }));
-        } else if (searchProvider === 'serper') {
-          const r = await fetch('https://google.serper.dev/search', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'X-API-KEY': searchKey },
-            body: JSON.stringify({ q: query, num: 6 }),
-          });
-          if (!r.ok) throw new Error('Serper error ' + r.status);
-          const data = await r.json();
-          results = (data.organic || []).slice(0, 6).map(item => ({
-            title: item.title || '', url: item.link || '', snippet: item.snippet || '',
-          }));
+        // DuckDuckGo HTML scrape — no API key required
+        const ddgUrl = 'https://html.duckduckgo.com/html/?q=' + encodeURIComponent(query);
+        const r = await fetch(ddgUrl, {
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml',
+            'Accept-Language': 'en-US,en;q=0.9',
+          },
+        });
+        if (!r.ok) throw new Error('DuckDuckGo fetch failed: ' + r.status);
+        const html = await r.text();
+
+        // Extract results: title from <a class="result__a">, snippet from result__snippet,
+        // URL from uddg= param inside the href
+        const results = [];
+        const blockRe = /<a[^>]+class="result__a"[^>]*href="([^"]*)"[^>]*>([\s\S]*?)<\/a>[\s\S]*?<a[^>]+class="result__snippet"[^>]*>([\s\S]*?)<\/a>/g;
+        let m;
+        while ((m = blockRe.exec(html)) !== null && results.length < 6) {
+          const rawHref = m[1];
+          const title   = m[2].replace(/<[^>]+>/g, '').trim();
+          const snippet = m[3].replace(/<[^>]+>/g, '').trim();
+          let url = rawHref;
+          const uddgMatch = rawHref.match(/[?&]uddg=([^&]+)/);
+          if (uddgMatch) url = decodeURIComponent(uddgMatch[1]);
+          else if (rawHref.startsWith('//')) url = 'https:' + rawHref;
+          if (title && snippet) results.push({ title, url, snippet });
         }
-        if (!results.length) { respond({ error: 'No search results returned.' }); return; }
+        if (!results.length) { respond({ error: 'No results from DuckDuckGo.' }); return; }
 
         const srcBlock = results.map((r, i) =>
           '[' + (i+1) + '] ' + r.title + '\n' + r.url + '\n' + r.snippet

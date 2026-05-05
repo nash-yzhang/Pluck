@@ -213,31 +213,6 @@
   <button id="save" class="primary">SAVE SETTINGS</button>
   <div id="status"></div>
 
-  <div class="section-title">SEARCH API  <span style="font-size:9px;opacity:.5;letter-spacing:0">(optional — powers [SEARCH:] web results)</span></div>
-
-  <div class="field">
-    <label>SEARCH PROVIDER</label>
-    <select id="search-provider">
-      <option value="brave">Brave Search  (api.search.brave.com — free tier: 2000 req/mo)</option>
-      <option value="serper">Serper  (google.serper.dev — free tier: 2500 req)</option>
-    </select>
-    <div class="hint">Pluck calls this API when you click a <code>[SEARCH: …]</code> suggestion in chat, then asks your LLM to summarize results with numbered citations.</div>
-  </div>
-
-  <div class="field">
-    <label>SEARCH API KEY</label>
-    <div class="row">
-      <input type="password" id="search-api-key" placeholder="BSA… / key-…" autocomplete="off" spellcheck="false"/>
-      <button id="toggle-search-key">SHOW</button>
-    </div>
-    <div id="search-key-hint" class="hint">
-      Brave: get a free key at <em>brave.com/search/api</em> &nbsp;|&nbsp;
-      Serper: <em>serper.dev</em>
-    </div>
-  </div>
-
-  <button id="save-search" class="primary">SAVE SEARCH SETTINGS</button>
-  <div id="search-status" style="font-size:11px;color:var(--accent);letter-spacing:1px;height:18px;margin-top:8px"></div>
 
   <div id="section-presets" class="section-title">PRESETS  (/ commands)</div>
   <div id="hint-presets" class="hint" style="margin-bottom:10px">Edit the built-in <code>/cmd</code> instructions, or add your own. Changes are saved to your data export for easy migration.</div>
