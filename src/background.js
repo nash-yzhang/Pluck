@@ -7,6 +7,19 @@ importScripts('providers.js');
 const LOG = (...a) => console.log('[CWA-BG]', ...a);
 const ERR = (...a) => console.error('[CWA-BG]', ...a);
 
+// In-memory set of tabIds where the side panel is currently open.
+// Kept in sync with cwaSpOpen in session storage, but readable synchronously
+// so sidePanel.open() can be called without any async hop (preserves user-gesture context).
+const spOpenTabs = new Set();
+
+// When the sidepanel closes (pagehide → cwaSpOpen: false), clear the set.
+// Since we don't know which tabId closed, clear all — they'll be re-added on next open.
+chrome.storage.session.onChanged.addListener(changes => {
+  if ('cwaSpOpen' in changes && !changes.cwaSpOpen.newValue) {
+    spOpenTabs.clear();
+  }
+});
+
 async function getConfig() {
   return new Promise(resolve => {
     chrome.storage.sync.get(['cwaApiKey', 'cwaApiKeys', 'cwaModel', 'cwaProvider'], r => {
@@ -373,46 +386,57 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
     })();
     return true;
   }
+  // Generic session-storage relay: content scripts on restricted pages can't write session storage directly
+  if (msg.type === 'SET_SESSION') {
+    if (msg.key && msg.value !== undefined) {
+      chrome.storage.session.set({ [msg.key]: msg.value });
+    }
+    return false;
+  }
   // content.js hotkey → open the sidebar and set the goChat flag for capture mode
   if (msg.type === 'OPEN_SIDE_PANEL') {
-    chrome.tabs.query({ active: true, currentWindow: true }, tabs => {
-      if (!tabs[0]) return;
-      chrome.sidePanel.open({ tabId: tabs[0].id })
+    // sidePanel.open() requires user-gesture context. We must NOT have any async hop
+    // (storage.get, tabs.query) before calling it. Use sender.tab.id (synchronous) and
+    // spOpenTabs (in-memory, synchronous) to decide whether to call open().
+    const tabId = sender && sender.tab && sender.tab.id;
+    if (!tabId) return false;
+
+    // Write handoff to session storage (no gesture required for storage writes)
+    if (msg.handoff) {
+      chrome.storage.session.set({ cwaFloatHandoff: msg.handoff });
+    }
+
+    if (spOpenTabs.has(tabId)) {
+      // Panel already open — storage.onChanged in the panel picks up the handoff.
+      // Calling sidePanel.open() again would reload/reset the panel.
+      LOG('OPEN_SIDE_PANEL: panel already open for tab', tabId, '— skipping; handoff=', !!msg.handoff);
+    } else {
+      chrome.sidePanel.open({ tabId })
         .then(() => {
-          if (msg.goChat) chrome.storage.session.set({ cwaGoChat: { t: Date.now() } });
+          spOpenTabs.add(tabId);
           chrome.storage.session.set({ cwaSpOpen: true });
+          if (!msg.handoff && msg.goChat) chrome.storage.session.set({ cwaGoChat: { t: Date.now() } });
         })
         .catch(e => ERR('sidePanel.open', e));
-    });
+    }
     return false;
   }
   // Alt+` toggle path — open or close the sidebar based on current state
   if (msg.type === 'TOGGLE_SIDE_PANEL') {
-    const msgT0 = Date.now();
-    LOG('DEBUG TOGGLE_SIDE_PANEL: message received from', sender.id || sender.origin || 'unknown', 'at T+0');
-    // ⚠ ROOT CAUSE NOTE: sidePanel.open() called AFTER async storage.get() loses user-gesture context.
-    // This path (content/sidepanel → sendMessage → onMessage) CANNOT call sidePanel.open() successfully.
-    // sidePanel.open() requires synchronous user-gesture context; onMessage handlers never have it.
-    // The chrome.commands.onCommand path below is the only correct path.
-    chrome.storage.session.get('cwaSpOpen', data => {
-      LOG('DEBUG TOGGLE_SIDE_PANEL: storage.get callback T+' + (Date.now() - msgT0) + 'ms; cwaSpOpen=', data.cwaSpOpen);
-      if (data.cwaSpOpen) {
-        chrome.windows.getCurrent(w => {
-          LOG('DEBUG TOGGLE_SIDE_PANEL: closing windowId=', w && w.id);
-          chrome.sidePanel.close({ windowId: w.id }).catch(e => LOG('DEBUG sidePanel.close error:', e.message));
-          chrome.storage.session.set({ cwaSpOpen: false });
-        });
-      } else {
-        chrome.tabs.query({ active: true, currentWindow: true }, tabs => {
-          LOG('DEBUG TOGGLE_SIDE_PANEL: open attempt T+' + (Date.now() - msgT0) + 'ms; tab=', tabs[0] && tabs[0].id,
-              '⚠ gesture context almost certainly lost by now — expect sidePanel.open() to fail');
-          if (!tabs[0]) { LOG('DEBUG TOGGLE_SIDE_PANEL: no active tab — aborting'); return; }
-          chrome.sidePanel.open({ tabId: tabs[0].id })
-            .then(() => { LOG('DEBUG TOGGLE_SIDE_PANEL: sidePanel.open() succeeded (unexpected)'); chrome.storage.session.set({ cwaSpOpen: true }); })
-            .catch(e => ERR('sidePanel.open', e, '← gesture-context error expected here'));
-        });
-      }
-    });
+    const tabId = sender && sender.tab && sender.tab.id;
+    if (!tabId) return false;
+    // Use spOpenTabs (in-memory) to avoid async storage read before sidePanel.open()
+    if (spOpenTabs.has(tabId)) {
+      chrome.windows.getCurrent(w => {
+        chrome.sidePanel.close({ windowId: w.id }).catch(e => LOG('sidePanel.close error:', e.message));
+        spOpenTabs.delete(tabId);
+        chrome.storage.session.set({ cwaSpOpen: false });
+      });
+    } else {
+      chrome.sidePanel.open({ tabId })
+        .then(() => { spOpenTabs.add(tabId); chrome.storage.session.set({ cwaSpOpen: true }); })
+        .catch(e => ERR('sidePanel.open TOGGLE_SIDE_PANEL', e));
+    }
     return false;
   }
   // New context capture: relay to side panel
@@ -636,6 +660,7 @@ chrome.commands.onCommand.addListener((command, tab) => {
         // This ensures the capture event is not missed due to race condition.
         setTimeout(() => {
           chrome.storage.session.set({ cwaGoCapture: { t: Date.now(), url: tab.url || '' } });
+          spOpenTabs.add(tab.id);
           chrome.storage.session.set({ cwaSpOpen: true });
         }, 300);
       })
@@ -648,26 +673,18 @@ chrome.commands.onCommand.addListener((command, tab) => {
   }
 
   if (command === 'toggle-sidebar') {
-    const cmdT0 = Date.now();
-    LOG('DEBUG toggle-sidebar: onCommand fired at T+0; reading cwaSpOpen from storage (ASYNC — will lose gesture context!)');
-    // ⚠ BUG: storage.get is async; sidePanel.open() inside its callback will fail with gesture error.
-    // Fix: call sidePanel.open() BEFORE the async storage.get, or cache state in a sync variable.
-    chrome.storage.session.get('cwaSpOpen', data => {
-      LOG('DEBUG toggle-sidebar: storage.get callback T+' + (Date.now() - cmdT0) + 'ms; cwaSpOpen=', data.cwaSpOpen);
-      if (data.cwaSpOpen) {
-        LOG('DEBUG toggle-sidebar: state=open → calling sidePanel.close()');
-        chrome.windows.getCurrent(w => {
-          LOG('DEBUG toggle-sidebar: closing windowId=', w && w.id);
-          chrome.sidePanel.close({ windowId: w.id }).catch(e => LOG('DEBUG sidePanel.close error:', e.message));
-          chrome.storage.session.set({ cwaSpOpen: false });
-        });
-      } else {
-        LOG('DEBUG toggle-sidebar: state=closed → calling sidePanel.open() T+' + (Date.now() - cmdT0) + 'ms ⚠ gesture likely expired');
-        chrome.sidePanel.open({ tabId: tab.id })
-          .then(() => { LOG('DEBUG toggle-sidebar: sidePanel.open() succeeded'); chrome.storage.session.set({ cwaSpOpen: true }); })
-          .catch(e => ERR('sidePanel.open', e, '← if gesture error: fix = call open() BEFORE storage.get()'));
-      }
-    });
+    // Use spOpenTabs (in-memory, synchronous) so sidePanel.open() is called with no async hop.
+    if (spOpenTabs.has(tab.id)) {
+      chrome.windows.getCurrent(w => {
+        chrome.sidePanel.close({ windowId: w.id }).catch(e => LOG('sidePanel.close error:', e.message));
+        spOpenTabs.delete(tab.id);
+        chrome.storage.session.set({ cwaSpOpen: false });
+      });
+    } else {
+      chrome.sidePanel.open({ tabId: tab.id })
+        .then(() => { spOpenTabs.add(tab.id); chrome.storage.session.set({ cwaSpOpen: true }); })
+        .catch(e => ERR('sidePanel.open', e));
+    }
   }
 });
 

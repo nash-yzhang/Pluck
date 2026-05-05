@@ -26,8 +26,8 @@
   let _pageObserver = null;
   window.__cwa_delta__ = null;
 
-  function openSidePanel(goChat) {
-    chrome.runtime.sendMessage({ type: 'OPEN_SIDE_PANEL', goChat: !!goChat }).catch(() => {});
+  function openSidePanel(goChat, handoff) {
+    chrome.runtime.sendMessage({ type: 'OPEN_SIDE_PANEL', goChat: !!goChat, handoff: handoff || null }).catch(() => {});
   }
   function toggleSidePanel() {
     chrome.runtime.sendMessage({ type: 'TOGGLE_SIDE_PANEL' }).catch(() => {});
@@ -50,182 +50,268 @@
   }
 
   // Visual mode helpers
-  const HIGHLIGHT_COLOR = '#ffcc44';
-  let _hoverEl = null;
-  let _highlightedEls = [];
+  // ── Selection highlight state machine ──────────────────────────────────
+  // States:  idle → picking → locked → idle
+  //   idle:    nothing active
+  //   picking: Alt+1 active; hover shows ghost outline; drag colors text green
+  //   locked:  element/text confirmed; solid green highlight; float is open
+  //
+  // Transitions:
+  //   idle    + Alt+1             → picking
+  //   picking + Alt+1 / Esc      → idle   (cancel, no highlight)
+  //   picking + mouseup w/ pick  → locked (apply highlight, show float)
+  //   locked  + Alt+1            → picking (start new pick, clears old HL)
+  //   locked  + Esc / close btn  → idle   (clears HL)
+  //   locked  + send/handoff     → idle   (clears HL before new locked is set)
 
-  function applyHL(el, css) {
-    if (!el || el === document.documentElement || el === document.body) return;
-    // Only snapshot the original style once — re-calls must not overwrite it,
-    // otherwise removeHL would restore to a state that already has our outline.
-    if (el.__cwa_prev__ === undefined) el.__cwa_prev__ = el.style.cssText;
-    // Always replace on top of the original (no accumulation of duplicate rules).
-    el.style.cssText = (el.__cwa_prev__ || '') + ';' + css;
-  }
-  function removeHL(el) {
-    if (!el || el.__cwa_prev__ === undefined) return;
-    el.style.cssText = el.__cwa_prev__ || '';
-    delete el.__cwa_prev__;
-  }
-  function clearHighlights() {
-    _highlightedEls.forEach(el => {
-      if (el.__cwa_text_span__) {
-        const p = el.parentNode;
-        if (p) { while (el.firstChild) p.insertBefore(el.firstChild, el); p.removeChild(el); p.normalize(); }
-      } else { removeHL(el); }
-    });
-    _highlightedEls = [];
-  }
+  const SEL = (function() {
+    const GHOST_CSS   = 'outline:1px solid rgba(77,250,154,0.35)!important;outline-offset:2px!important;cursor:crosshair!important;';
+    const LOCKED_CSS  = 'outline:2px solid #4dfa9a!important;outline-offset:3px!important;box-shadow:0 0 0 4px rgba(77,250,154,0.10)!important;';
+    const TEXT_HL_CSS = 'background:rgba(77,250,154,0.18)!important;color:inherit!important;' +
+                        'text-decoration:underline!important;text-decoration-color:#4dfa9a!important;' +
+                        'text-underline-offset:3px!important;outline:none!important;border-radius:2px!important;';
+    let _state    = 'idle';
+    let _hover    = null;   // ghosted element
+    let _lockEl   = null;   // locked element
+    let _lockPrev = '';     // its original style
+    let _marks    = [];     // locked text <mark> nodes
+    let _selStyle = null;   // <style> for drag ::selection color
 
-  let _selectionStyle = null;
-  function setVisualSelectionStyle(active) {
-    if (active && !_selectionStyle) {
-      _selectionStyle = document.createElement('style');
-      _selectionStyle.id = '__cwa_sel_style__';
-      _selectionStyle.textContent = '::selection{background:#ffcc44 !important;color:#000 !important;} ::-moz-selection{background:#ffcc44 !important;color:#000 !important;}';
-      document.head.appendChild(_selectionStyle);
-    } else if (!active && _selectionStyle) {
-      _selectionStyle.remove();
-      _selectionStyle = null;
+    function _applyEl(el, css) {
+      if (!el || el === document.documentElement || el === document.body) return;
+      if (el.__cwa_orig__ === undefined) el.__cwa_orig__ = el.style.cssText;
+      el.style.cssText = (el.__cwa_orig__ || '') + ';' + css;
     }
-  }
+    function _restoreEl(el) {
+      if (!el || el.__cwa_orig__ === undefined) return;
+      el.style.cssText = el.__cwa_orig__ || '';
+      delete el.__cwa_orig__;
+    }
+    function _clearHover() {
+      if (_hover) { _restoreEl(_hover); _hover = null; }
+    }
+    function _clearLock() {
+      if (_lockEl) { _lockEl.style.cssText = _lockPrev; _lockEl = null; _lockPrev = ''; }
+      _marks.forEach(m => {
+        const p = m.parentNode;
+        if (p) { while (m.firstChild) p.insertBefore(m.firstChild, m); try { p.removeChild(m); p.normalize(); } catch(_){} }
+      });
+      _marks = [];
+    }
+    function _setDragStyle(on) {
+      if (on && !_selStyle) {
+        _selStyle = document.createElement('style');
+        _selStyle.id = '__cwa_sel_style__';
+        _selStyle.textContent = '::selection{background:rgba(77,250,154,0.35)!important;color:inherit!important}' +
+                                '::-moz-selection{background:rgba(77,250,154,0.35)!important;color:inherit!important}';
+        document.head.appendChild(_selStyle);
+      } else if (!on && _selStyle) { _selStyle.remove(); _selStyle = null; }
+    }
 
+    return {
+      get state() { return _state; },
+
+      // Enter picking mode (Alt+1 from idle, or Alt+1 from locked to restart)
+      startPicking() {
+        _clearHover();
+        _clearLock();
+        _state = 'picking';
+        S.visualMode = true;
+        document.documentElement.style.cursor = 'crosshair';
+      },
+
+      // Cancel picking / dismiss lock — go to idle
+      reset() {
+        _clearHover();
+        _clearLock();
+        _setDragStyle(false);
+        _state = 'idle';
+        S.visualMode = false;
+        document.documentElement.style.cursor = '';
+      },
+
+      // Ghost hover during picking
+      hover(el) {
+        if (_state !== 'picking') return;
+        if (_hover === el) return;
+        _clearHover();
+        _hover = el;
+        if (el) _applyEl(el, GHOST_CSS);
+      },
+      unhover(el) {
+        if (_hover === el) _clearHover();
+      },
+
+      // Signal mousedown during drag — turn on green ::selection color
+      dragStart() { if (_state === 'picking') _setDragStyle(true); },
+      dragEnd()   { _setDragStyle(false); },
+
+      // Lock element pick (solid outline)
+      lockElement(el) {
+        _clearHover();
+        _clearLock();
+        if (!el || el === document.documentElement || el === document.body) return;
+        _lockEl   = el;
+        _lockPrev = el.style.cssText;
+        _applyEl(el, LOCKED_CSS);
+        _state = 'locked';
+        S.visualMode = false;
+        document.documentElement.style.cursor = '';
+      },
+
+      // Lock text selection (underline+background mark)
+      lockText() {
+        _clearHover();
+        _clearLock();
+        const sel = window.getSelection();
+        if (!sel || sel.rangeCount === 0) { _state = 'idle'; S.visualMode = false; document.documentElement.style.cursor = ''; return; }
+        const marks = [];
+        try {
+          for (let i = 0; i < sel.rangeCount; i++) {
+            const range = sel.getRangeAt(i);
+            const mark = document.createElement('mark');
+            mark.className = '__cwa_sel__';
+            mark.style.cssText = TEXT_HL_CSS;
+            try { range.surroundContents(mark); marks.push(mark); } catch (_) {
+              // Range spans element boundaries — wrap each text node individually
+              const frag = range.extractContents();
+              mark.appendChild(frag);
+              range.insertNode(mark);
+              marks.push(mark);
+            }
+          }
+          sel.removeAllRanges();
+        } catch (_) {}
+        _marks = marks;
+        _state = 'locked';
+        S.visualMode = false;
+        document.documentElement.style.cursor = '';
+      },
+    };
+  })();
+
+  // ── Mouse event handlers (visual pick mode) ─────────────────────────────
   document.addEventListener('mouseover', function(e) {
-    if (!S.visualMode && !S.copyMode) return;
-    const target = e.target;
-    if (_hoverEl && _hoverEl !== target) { removeHL(_hoverEl); _hoverEl = null; }
-    _hoverEl = target;
-    applyHL(target, `outline:2px solid ${HIGHLIGHT_COLOR} !important;outline-offset:2px !important;cursor:crosshair !important;`);
+    if (SEL.state !== 'picking') return;
+    SEL.hover(e.target);
   }, true);
   document.addEventListener('mouseout', function(e) {
-    if (!S.visualMode && !S.copyMode) return;
-    if (e.target === _hoverEl) { removeHL(_hoverEl); _hoverEl = null; }
+    if (SEL.state !== 'picking') return;
+    SEL.unhover(e.target);
   }, true);
 
   let _click = { x: 0, y: 0, moved: false, el: null };
   document.addEventListener('mousedown', function(e) {
-    if (!S.visualMode && !S.copyMode) return;
-    _click = { x: e.clientX, y: e.clientY, moved: false, el: e.target };
-    if (_hoverEl) {
-      removeHL(_hoverEl);
-      applyHL(_hoverEl, `outline:2px dashed #336633 !important;outline-offset:2px !important;cursor:crosshair !important;`);
+    if (SEL.state === 'picking') {
+      _click = { x: e.clientX, y: e.clientY, moved: false, el: e.target };
+      SEL.dragStart();
+      return;
     }
-    setVisualSelectionStyle(true);
+    if (S.copyMode) { _click = { x: e.clientX, y: e.clientY, moved: false, el: e.target }; }
   }, true);
   document.addEventListener('mousemove', function(e) {
     if (!_click.el) return;
-    const d = Math.hypot(e.clientX - _click.x, e.clientY - _click.y);
-    if (d > 3) _click.moved = true;
+    if (Math.hypot(e.clientX - _click.x, e.clientY - _click.y) > 3) _click.moved = true;
   }, true);
   document.addEventListener('mouseup', function(e) {
-    if (!S.visualMode && !S.copyMode) { _click = {}; return; }
+    SEL.dragEnd();
+    if (SEL.state !== 'picking' && !S.copyMode) { _click = {}; return; }
+
     const selObj  = window.getSelection();
     const selText = selObj && selObj.toString().trim();
 
-    if (_hoverEl) {
-      removeHL(_hoverEl);
-      applyHL(_hoverEl, `outline:2px solid ${HIGHLIGHT_COLOR} !important;outline-offset:2px !important;cursor:crosshair !important;`);
+    if (S.copyMode) {
+      let text = selText;
+      if (!text && _click.el) text = (_click.el.innerText || _click.el.textContent || '').trim();
+      if (text) {
+        navigator.clipboard.writeText(text + '\n\n[Source: ' + location.href + ']').catch(() => {});
+        showSelToast('Copied with URL', false);
+      }
+      _click = {};
+      exitCopyMode();
+      return;
     }
-    setVisualSelectionStyle(false);
 
+    // Visual pick mode
     let captured = null;
-    let elementPick = false;
+    let isElement = false;
     if (selText && _click.moved) {
+      // Text drag selection
       const parentEl = selObj.anchorNode && selObj.anchorNode.parentElement;
       const ctx = parentEl ? (parentEl.innerText || parentEl.textContent || '').trim() : selText;
       const selRange = selObj.rangeCount > 0 ? selObj.getRangeAt(0) : null;
       captured = { text: selText, context: ctx, rect: selRange ? selRange.getBoundingClientRect() : null };
-    } else if (!_click.moved && _click.el && !selText) {
-      const el   = e.target === _click.el ? e.target : _click.el;
+    } else if (!_click.moved && _click.el) {
+      // Element click
+      const el = e.target === _click.el ? e.target : _click.el;
       const text = (el.innerText || el.textContent || '').trim();
-      if (text) { captured = { text, context: text, rect: el.getBoundingClientRect() }; elementPick = true; }
+      if (text) { captured = { text, context: text, rect: el.getBoundingClientRect(), _el: el }; isElement = true; }
     }
     _click = {};
     if (!captured) return;
 
-    if (S.copyMode) {
-      const textWithUrl = captured.text + '\n\n[Source: ' + location.href + ']';
-      navigator.clipboard.writeText(textWithUrl).catch(err => ERR('copy failed', err));
-      showSelToast('Copied with URL', false);
-      exitCopyMode();
-      return;
-    }
-    if (S.visualMode) {
-      showSelToast(captured.text, false);
-      exitVisualMode();
-      // Phase 2-A: show inline float near picked element / selection
-      showAskFloat(captured.rect || null, captured.text);
-    }
+    // Phase B: lock highlight
+    if (isElement) { SEL.lockElement(captured._el); }
+    else            { SEL.lockText(); }
+
+    showSelToast(captured.text, false);
+    showAskFloat(captured.rect || null, captured.text);
   }, true);
 
   function exitCopyMode() {
     S.copyMode = false;
-    if (_hoverEl) { removeHL(_hoverEl); _hoverEl = null; }
-    clearHighlights();
     document.documentElement.style.cursor = '';
   }
-  function exitVisualMode() {
-    S.visualMode = false;
-    if (_hoverEl) { removeHL(_hoverEl); _hoverEl = null; }
-    clearHighlights();
-  }
+  // exitVisualMode kept as thin alias for compatibility (message handler, etc.)
+  function exitVisualMode() { SEL.reset(); }
+  // clearPersistHL alias for CLEAR_SEL_HL message handler
+  function clearPersistHL() { SEL.reset(); }
 
-  // Right-click exits visual/copy mode
+  // Right-click cancels picking
   document.addEventListener('contextmenu', function(e) {
-    if (S.visualMode || S.copyMode) {
-      e.preventDefault();
-      if (S.visualMode) exitVisualMode();
-      if (S.copyMode)   exitCopyMode();
-    }
+    if (SEL.state === 'picking') { e.preventDefault(); SEL.reset(); return; }
+    if (S.copyMode) { e.preventDefault(); exitCopyMode(); }
   }, true);
 
   document.addEventListener('keydown', function(e) {
-    // Alt+` — toggle sidebar (Alt+K in manifest is the proper path via chrome.commands)
-    // Kept here as fallback; onMessage cannot call sidePanel.open() from gesture context
     const isToggle = e.altKey && !e.ctrlKey && !e.shiftKey && e.code === 'Backquote';
-    if (isToggle) {
-      LOG('DEBUG keydown toggle: e.code=', e.code, 'e.key=', e.key);
-      LOG('DEBUG toggle: sending TOGGLE_SIDE_PANEL to background (⚠ onMessage cannot call sidePanel.open — only closes side)');
-      e.preventDefault(); toggleSidePanel(); return;
-    }
-    // Alt+1 — enter visual-select mode (creates new context entry)
-    // On PDFs, just open sidebar to trigger text extraction
+    if (isToggle) { e.preventDefault(); toggleSidePanel(); return; }
+
     if (e.altKey && !e.ctrlKey && e.code === 'Digit1') {
       e.preventDefault();
       const isPdf = location.href.includes('chrome-extension://mhjfbmdgcfjbbpaeojofohoefgiehjai');
       if (isPdf) { openSidePanel(true); return; }
-      // If text is already selected, show float immediately (no visual-pick mode)
-      const _pgSel = window.getSelection();
-      const _pgSelTxt = _pgSel && _pgSel.toString().trim();
-      if (_pgSelTxt) {
-        const _pgSelRange = _pgSel.rangeCount > 0 ? _pgSel.getRangeAt(0) : null;
-        showAskFloat(_pgSelRange ? _pgSelRange.getBoundingClientRect() : null, _pgSelTxt);
+      // Already-selected text → lock immediately and show float
+      const pgSel = window.getSelection();
+      const pgTxt = pgSel && pgSel.toString().trim();
+      if (pgTxt && SEL.state === 'idle') {
+        const pgRange = pgSel.rangeCount > 0 ? pgSel.getRangeAt(0) : null;
+        SEL.lockText();
+        showAskFloat(pgRange ? pgRange.getBoundingClientRect() : null, pgTxt);
         return;
       }
-      if (S.visualMode) { exitVisualMode(); return; }
-      S.visualMode = true;
-      // Float appears when user picks an element (mouseup handler); sidebar is NOT opened yet
+      if (SEL.state === 'picking') { SEL.reset(); return; }  // Alt+1 again = cancel
+      if (SEL.state === 'locked')  { SEL.startPicking(); return; }  // Alt+1 = new pick
+      SEL.startPicking();
       return;
     }
+
     if (e.altKey && !e.ctrlKey && !e.shiftKey && e.code === 'Digit2') {
       e.preventDefault();
-      const isPdf = location.href.includes('chrome-extension://mhjfbmdgcfjbbpaeojofohoefgiehjai');
-      if (isPdf) return; // Copy mode not supported on PDFs
+      if (location.href.includes('chrome-extension://mhjfbmdgcfjbbpaeojofohoefgiehjai')) return;
       if (S.copyMode) { exitCopyMode(); return; }
-      const pageSel = window.getSelection();
-      const txt = pageSel && pageSel.toString().trim();
-      if (txt) { navigator.clipboard.writeText(txt).catch(err => ERR('copy failed', err)); return; }
+      const txt = window.getSelection() && window.getSelection().toString().trim();
+      if (txt) { navigator.clipboard.writeText(txt).catch(() => {}); return; }
       S.copyMode = true;
       document.documentElement.style.cursor = 'crosshair';
       return;
     }
-    // Alt+S — handled via chrome.commands.onCommand in background.js → TOGGLE_FIND_PANEL message
-    // (Chrome intercepts registered commands before content scripts receive keydown events)
+
     if (e.key === 'Escape') {
-      if (_find.visible) { hideFindPanel(); return; }
-      if (_float.panel && _float.panel.style.display !== 'none') { hideAskFloat(); return; }
-      if (S.visualMode) exitVisualMode();
-      if (S.copyMode)   exitCopyMode();
+      if (_find.visible)                                      { hideFindPanel(); return; }
+      if (_float.panel && _float.panel.style.display !== 'none') { hideAskFloat(true); return; }
+      if (SEL.state !== 'idle') { SEL.reset(); return; }
+      if (S.copyMode) exitCopyMode();
     }
   }, true);
 
@@ -237,9 +323,10 @@
     if (msg.type === 'FIND_CHUNK') { _applyFindChunk(msg.text, msg.score, msg.searchId); }
     if (msg.type === 'FIND_DONE')  { _finalizeFindSearch(msg.searchId); }
     if (msg.type === 'TOGGLE_VISUAL_MODE') {
-      if (S.visualMode) { exitVisualMode(); }
-      else { S.visualMode = true; }
+      if (SEL.state === 'picking') { SEL.reset(); }
+      else { SEL.startPicking(); }
     }
+    if (msg.type === 'CLEAR_SEL_HL') { SEL.reset(); }
     if (msg.type === 'HIGHLIGHT_TRACES') { applyTraceHighlights(msg.snippets); }
     if (msg.type === 'CLEAR_TRACE_HIGHLIGHTS') { clearTraceHighlights(); }
   });
@@ -938,6 +1025,15 @@
   function createAskFloat() {
     if (_float.panel) return;
     const FW = 300;
+
+    // Inject pulse keyframes once
+    if (!document.getElementById('__cwa_float_styles__')) {
+      const st = document.createElement('style');
+      st.id = '__cwa_float_styles__';
+      st.textContent = '@keyframes cwa-float-hl-pulse{0%,100%{outline-color:rgba(77,250,154,0.55)}50%{outline-color:rgba(77,250,154,1);background:rgba(77,250,154,0.40) !important}}';
+      document.head.appendChild(st);
+    }
+
     const panel = document.createElement('div');
     panel.id = '__cwa_ask_float__';
     panel.style.cssText =
@@ -963,23 +1059,6 @@
       document.addEventListener('mouseup', onUp);
     });
 
-    // header: model badge + status dot + status text
-    const header = document.createElement('div');
-    header.style.cssText = 'display:flex;align-items:center;gap:6px;padding:5px 8px;border-bottom:1px solid rgba(77,250,154,0.2);';
-    const modelBadge = document.createElement('button');
-    modelBadge.style.cssText = 'background:none;border:1px solid #3a3a50;border-radius:2px;color:#7090b0;font:9px monospace;padding:2px 5px;cursor:pointer;letter-spacing:1px;transition:all .15s;flex-shrink:0;';
-    const statusDot = document.createElement('span');
-    statusDot.style.cssText = 'width:5px;height:5px;border-radius:50%;background:#4dfa9a;flex-shrink:0;';
-    const statusTxt = document.createElement('span');
-    statusTxt.style.cssText = 'font-size:9px;color:#4dfa9a;letter-spacing:1.5px;flex:1;';
-    statusTxt.textContent = 'READY';
-    const closeHdr = document.createElement('button');
-    closeHdr.textContent = '\xd7';
-    closeHdr.style.cssText = 'background:none;border:none;color:#ff5e57;font:14px monospace;cursor:pointer;padding:0 2px;line-height:1;';
-    closeHdr.addEventListener('click', hideAskFloat);
-    header.append(modelBadge, statusDot, statusTxt, closeHdr);
-    _float.modelBadge = modelBadge; _float.statusDot = statusDot; _float.statusTxt = statusTxt;
-
     // reply area (hidden until first answer arrives)
     const replyDiv = document.createElement('div');
     replyDiv.style.cssText = 'display:none;padding:6px 8px;font-size:11px;color:#c8d0e0;line-height:1.6;max-height:200px;overflow-y:auto;border-bottom:1px solid rgba(77,250,154,0.12);white-space:pre-wrap;word-break:break-word;';
@@ -994,20 +1073,60 @@
       'font:12px monospace;padding:7px 8px;resize:none;outline:none;width:100%;box-sizing:border-box;' +
       'max-height:80px;overflow-y:auto;line-height:1.5;';
     textarea.addEventListener('keydown', function(e) {
-      if (e.key === 'Escape') { e.preventDefault(); hideAskFloat(); return; }
-      if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); _floatSend(); }
+      if (e.key === 'Escape') { e.preventDefault(); hideAskFloat(true); return; }
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        _floatSend();
+      }
     });
     _float.textarea = textarea;
 
-    // footer: send / abort button
+    // footer: model \u00b7 status \u00b7 spacer \u00b7 maximize \u00b7 send/abort \u00b7 close
     const footer = document.createElement('div');
-    footer.style.cssText = 'display:flex;align-items:center;justify-content:flex-end;padding:4px 8px;gap:6px;';
+    footer.style.cssText = 'display:flex;align-items:center;padding:4px 6px;gap:4px;border-top:1px solid rgba(77,250,154,0.15);';
+    const modelBadge = document.createElement('button');
+    modelBadge.style.cssText = 'background:none;border:1px solid #3a3a50;border-radius:2px;color:#7090b0;font:9px monospace;padding:2px 5px;cursor:pointer;letter-spacing:1px;transition:all .15s;flex-shrink:0;';
+    modelBadge.title = 'Click to cycle model';
+    const _FLOAT_MODELS = [
+      ['gpt-4o-mini','openai'],['gpt-5-mini','openai'],['gpt-4o','openai'],
+      ['deepseek-chat','deepseek'],['deepseek-reasoner','deepseek'],
+      ['claude-3-5-haiku-latest','claude'],['claude-3-5-sonnet-latest','claude'],
+    ];
+    modelBadge.addEventListener('click', function() {
+      const idx = _FLOAT_MODELS.findIndex(([m]) => m === _float.model);
+      const next = _FLOAT_MODELS[(idx + 1) % _FLOAT_MODELS.length];
+      _float.model = next[0];
+      modelBadge.textContent = next[0].split('/').pop().slice(0, 18).toUpperCase();
+      chrome.storage.sync.set({ cwaModel: next[0], cwaProvider: next[1] });
+    });
+    const statusDot = document.createElement('span');
+    statusDot.style.cssText = 'width:5px;height:5px;border-radius:50%;background:#4dfa9a;flex-shrink:0;';
+    const statusTxt = document.createElement('span');
+    statusTxt.style.cssText = 'font-size:9px;color:#4dfa9a;letter-spacing:1.5px;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;';
+    statusTxt.textContent = 'READY';
+    _float.modelBadge = modelBadge; _float.statusDot = statusDot; _float.statusTxt = statusTxt;
+    const maximizeBtn = document.createElement('button');
+    maximizeBtn.textContent = '\u2922';
+    maximizeBtn.title = 'Continue in sidebar';
+    maximizeBtn.style.cssText = 'background:none;border:1px solid #3a3a50;border-radius:2px;color:#7090b0;font:11px monospace;padding:2px 5px;cursor:pointer;transition:all .15s;flex-shrink:0;';
+    maximizeBtn.addEventListener('mouseover', () => { maximizeBtn.style.color = '#4dfa9a'; maximizeBtn.style.borderColor = '#4dfa9a'; });
+    maximizeBtn.addEventListener('mouseout',  () => { maximizeBtn.style.color = '#7090b0'; maximizeBtn.style.borderColor = '#3a3a50'; });
+    maximizeBtn.addEventListener('click', function() {
+      const handoff = {
+        firstQ: _float.firstQ, firstA: _float.firstA,
+        secondQ: _float.textarea ? _float.textarea.value.trim() : '',
+        selection: _float.sel, url: location.href, title: document.title,
+      };
+      console.log('[CWA-FLOAT] maximizeBtn: sending handoff via OPEN_SIDE_PANEL; firstQ=', !!handoff.firstQ, 'firstA=', !!handoff.firstA);
+      hideAskFloat();
+      openSidePanel(true, handoff);
+    });
     const sendBtn = document.createElement('button');
     sendBtn.textContent = '\u25b6';
     sendBtn.title = 'Send (Enter)';
     sendBtn.style.cssText =
       'background:none;border:1px solid #2a2a38;border-radius:2px;color:#9090a0;' +
-      'font:12px monospace;padding:3px 10px;cursor:pointer;transition:all .15s;min-height:24px;';
+      'font:12px monospace;padding:3px 8px;cursor:pointer;transition:all .15s;flex-shrink:0;';
     sendBtn.addEventListener('mouseover', () => { sendBtn.style.color = '#4dfa9a'; sendBtn.style.borderColor = '#4dfa9a'; });
     sendBtn.addEventListener('mouseout',  () => {
       sendBtn.style.color = _float.state === 'streaming' ? '#ff5e57' : '#9090a0';
@@ -1017,9 +1136,14 @@
       if (_float.state === 'streaming') { _floatAbort(); } else { _floatSend(); }
     });
     _float.sendBtn = sendBtn;
-    footer.append(sendBtn);
+    const closeBtn = document.createElement('button');
+    closeBtn.textContent = '\xd7';
+    closeBtn.title = 'Close';
+    closeBtn.style.cssText = 'background:none;border:none;color:#ff5e57;font:14px monospace;cursor:pointer;padding:0 3px;line-height:1;flex-shrink:0;';
+    closeBtn.addEventListener('click', () => hideAskFloat(true));
+    footer.append(modelBadge, statusDot, statusTxt, maximizeBtn, sendBtn, closeBtn);
 
-    panel.append(drag, header, replyDiv, textarea, footer);
+    panel.append(drag, replyDiv, textarea, footer);
     document.body.appendChild(panel);
     _float.panel = panel;
   }
@@ -1059,10 +1183,19 @@
     setTimeout(function() { _float.textarea.focus(); }, 0);
   }
 
-  function hideAskFloat() {
+  function hideAskFloat(clearSel) {
     _floatAbort();
     if (_float.panel) _float.panel.style.display = 'none';
     _float.state = 'idle';
+    if (clearSel) {
+      // Explicit dismiss (Esc / ✕) — always clear the selection highlight
+      SEL.reset();
+    } else {
+      // Handoff path — keep HL alive if sidebar is taking over
+      chrome.storage.session.get('cwaSpOpen', function(d) {
+        if (!d.cwaSpOpen) SEL.reset();
+      });
+    }
   }
 
   function _floatAbort() {
@@ -1095,10 +1228,9 @@
         url:       location.href,
         title:     document.title,
       };
-      chrome.storage.session.set({ cwaFloatHandoff: handoff }, function() {
-        hideAskFloat();
-        openSidePanel(true);
-      });
+      console.log('[CWA-FLOAT] _floatSend done_first: sending handoff via OPEN_SIDE_PANEL; firstQ=', !!handoff.firstQ, 'secondQ=', q.slice(0,30));
+      hideAskFloat();
+      openSidePanel(true, handoff);
       return;
     }
 
@@ -1152,6 +1284,10 @@
       _float.textarea.placeholder = 'Follow-up\u2026 (opens sidebar)';
       _float.textarea.disabled = false;
       _float.textarea.focus();
+      // Save Q/A so sidebar can pick up seamlessly if user opens it without typing a follow-up
+      if (!msg.error) {
+        try { chrome.runtime.sendMessage({ type: 'SET_SESSION', key: 'cwaFloatPending', value: { firstQ: _float.firstQ, firstA: reply, sel: _float.sel, url: location.href, title: document.title } }).catch(() => {}); } catch(_) {}
+      }
     });
     port.onDisconnect.addListener(function() {
       if (_float.state === 'streaming') {

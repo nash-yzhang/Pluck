@@ -47,8 +47,7 @@ const S = {
   lastCtxSels:            [],   // last-used context selections (persisted across Q&As)
   suppressHistoryRender:  false, // true while TRACE_SAVE is in flight
   autoCtxId:         null,  // ID of auto-captured full-page ctx for current URL
-  ctxUrlToPage:      {},   // { [url]: pageNum } for sequential IDs
-  ctxNextPageNum:    1,    // next global page number
+  ctxNextId:         1,    // global monotone context ID counter
   pageHtmlCache:     {},   // { [url]: { uid, text, title, createdAt } } — session-level page text cache
   resumeCache:       {},   // { [url]: string } — LLM session resume summaries (persisted)
 };
@@ -72,9 +71,6 @@ const el = {
   chatInpMirror: $('chat-inp-mirror'),
   chatSend:      $('chat-send'),
   atHint:        $('at-hint'),
-  ctxSearchPanel: $('ctx-search-panel'),
-  ctxSearchInp:   $('ctx-search-inp'),
-  ctxSearchRes:   $('ctx-search-results'),
   chatSbarSlot:  $('chat-sbar-slot'),
   modelBadge:    $('model-badge'),
   gearBtn:       $('gear-btn'),
@@ -85,6 +81,32 @@ const el = {
   delConfirmOk:  $('del-confirm-ok'),
   delConfirmCancel: $('del-confirm-cancel'),
 };
+
+// ── Debug console (Alt+F12) ───────────────────────────────────────────────
+const _dbgLines = $('dbg-lines');
+const _dbgClear = $('dbg-console-clear');
+if (_dbgClear) _dbgClear.addEventListener('click', () => { if (_dbgLines) _dbgLines.innerHTML = ''; });
+
+function HDBG(...args) {
+  const text = args.map(a => (typeof a === 'object' ? JSON.stringify(a) : String(a))).join(' ');
+  LOG(text);
+  if (!_dbgLines) return;
+  const lvl = /✗|FAIL|fail|error|Error/.test(text) ? 'err'
+            : /WARN|warn/.test(text) ? 'warn'
+            : /▶|INIT|ONCHG/.test(text) ? 'info' : '';
+  const line = document.createElement('div');
+  line.className = 'dl' + (lvl ? ' ' + lvl : '');
+  line.textContent = new Date().toISOString().slice(11, 23) + '  ' + text;
+  _dbgLines.appendChild(line);
+  _dbgLines.scrollTop = _dbgLines.scrollHeight;
+}
+
+document.addEventListener('keydown', function(e) {
+  if (e.altKey && e.key === 'F12') {
+    e.preventDefault();
+    document.body.classList.toggle('dbg-open');
+  }
+}, true);
 
 //  Bootstrap 
 async function init() {
@@ -262,7 +284,12 @@ async function init() {
     if (area === 'local' && changes[CTX_STORE_KEY]) S.ctxStore = changes[CTX_STORE_KEY].newValue || {};
     if (area === 'session') {
       if (changes.cwaSelMsg)    onSelMsg(changes.cwaSelMsg.newValue);
-      if (changes.cwaGoChat)    navigateToCurrent(); // hotkey  jump to chat view
+      if (changes.cwaGoChat && changes.cwaGoChat.newValue && !S.floatHandoffBusy) navigateToCurrent(); // hotkey jump to chat view
+      if (changes.cwaFloatHandoff && changes.cwaFloatHandoff.newValue) {
+        HDBG('ONCHG▶ cwaFloatHandoff changed; calling onFloatHandoff');
+        onFloatHandoff(changes.cwaFloatHandoff.newValue);
+      }
+      if (changes.cwaFloatPending && changes.cwaFloatPending.newValue && !S.floatHandoffBusy) onFloatPending(changes.cwaFloatPending.newValue);
       if (changes.cwaGoCapture) { LOG('DEBUG storage.onChanged cwaGoCapture fired:', JSON.stringify(changes.cwaGoCapture.newValue)); onGoCapture(changes.cwaGoCapture.newValue); }
     }
     if (area === 'sync') {
@@ -291,59 +318,150 @@ async function init() {
 
   // Race-condition fix: background may have set cwaGoCapture BEFORE this listener was registered
   // (common when sidepanel was just opened by the Alt+1 command). Replay any pending keys.
-  chrome.storage.session.get(['cwaGoCapture', 'cwaGoChat', 'cwaSelMsg', 'cwaFloatHandoff'], pending => {
-    LOG('DEBUG init: checking pending session keys on startup',
-        'cwaGoCapture=', !!pending.cwaGoCapture,
-        'cwaGoChat=', !!pending.cwaGoChat,
-        'cwaSelMsg=', !!pending.cwaSelMsg,
-        'cwaFloatHandoff=', !!pending.cwaFloatHandoff);
+  chrome.storage.session.get(['cwaGoCapture', 'cwaGoChat', 'cwaSelMsg', 'cwaFloatHandoff', 'cwaFloatPending'], pending => {
+    HDBG('INIT▶ pending keys: handoff=', !!pending.cwaFloatHandoff,
+        'pending=', !!pending.cwaFloatPending,
+        'goChat=', !!pending.cwaGoChat,
+        'goCapture=', !!pending.cwaGoCapture);
+    if (pending.cwaFloatHandoff) HDBG('INIT▶ handoff payload firstQ=', !!(pending.cwaFloatHandoff.firstQ), 'url=', pending.cwaFloatHandoff.url);
     if (pending.cwaGoCapture) {
       LOG('DEBUG init: replaying missed cwaGoCapture', JSON.stringify(pending.cwaGoCapture));
       onGoCapture(pending.cwaGoCapture);
     }
-    if (pending.cwaGoChat) navigateToCurrent();
+    if (pending.cwaGoChat && !pending.cwaFloatHandoff) navigateToCurrent();
     if (pending.cwaSelMsg) onSelMsg(pending.cwaSelMsg);
     if (pending.cwaFloatHandoff) onFloatHandoff(pending.cwaFloatHandoff);
+    else if (pending.cwaFloatPending) onFloatPending(pending.cwaFloatPending);
   });
 
+  // Keep cwaSpOpen in sync so background.js knows the panel is alive
+  window.addEventListener('pagehide', () => {
+    chrome.storage.session.remove('cwaSpOpen');
+    // Tell the content script to clear the selection highlight when sidebar closes
+    chrome.tabs.query({ active: true, currentWindow: true }, tabs => {
+      if (tabs[0]) chrome.tabs.sendMessage(tabs[0].id, { type: 'CLEAR_SEL_HL' }).catch(() => {});
+    });
+  });
   LOG('init');
 }
 
 //  Preset bar (hidden — presets activated via /cmd inline text) 
 function renderPresetBar() { /* no-op: presets now via /cmd in input */ }
 
-// Phase 2-C: receive float handoff — pre-populate chat with first Q/A then auto-send second Q
+// Phase 2-C: receive float handoff — pre-populate chat with first Q/A then optionally auto-send second Q
 async function onFloatHandoff(handoff) {
-  chrome.storage.session.remove('cwaFloatHandoff');
-  if (!handoff || !handoff.secondQ) return;
+  HDBG('HANDOFF▶ called; firstQ=', !!(handoff && handoff.firstQ),
+      'firstA=', !!(handoff && handoff.firstA),
+      'secondQ=', !!(handoff && handoff.secondQ),
+      'url=', handoff && handoff.url);
+  chrome.storage.session.remove(['cwaFloatHandoff', 'cwaGoChat']);
+  if (!handoff) { HDBG('HANDOFF✗ handoff null'); return; }
+  S.floatHandoffBusy = true;
   try {
-    // Navigate to chat view for the correct URL
-    S.currentUrl   = handoff.url   || S.currentUrl;
+    const normUrl  = normalizeUrl(handoff.url || S.currentUrl);
+    S.currentUrl   = normUrl;
     S.currentTitle = handoff.title || S.currentTitle;
-    await navigateToCurrent();
-    // Pre-populate history with the two float turns
-    if (handoff.firstQ && handoff.firstA) {
-      appendMsgEl('user',      handoff.firstQ, false, null);
-      appendMsgEl('assistant', handoff.firstA, false,
-        handoff.selection ? [{ text: handoff.selection, url: handoff.url, title: handoff.title }] : null);
-      // Persist the two turns into S.currentEntry so they count as history
-      const floatPair = [
-        { timestamp: Date.now() - 1, role: 'user',      message: handoff.firstQ,  context: handoff.selection || '' },
-        { timestamp: Date.now(),     role: 'assistant', message: handoff.firstA,  context: '',
-          contextRefs: handoff.selection ? [{ text: handoff.selection, url: handoff.url, title: handoff.title }] : [] },
-      ];
-      if (S.currentEntry) {
-        if (!S.currentEntry.content) S.currentEntry.content = [];
-        S.currentEntry.content.push(...floatPair);
-      } else {
-        S.currentEntry = { url: handoff.url, title: handoff.title || handoff.url, context: [], content: floatPair };
-      }
+    HDBG('HANDOFF▶ normUrl=', normUrl);
+
+    const hist     = await loadHistory();
+    let entryIdx   = hist.entries.findIndex(e => e.url === normUrl);
+    HDBG('HANDOFF▶ hist.entries=', hist.entries.length, 'entryIdx=', entryIdx,
+         'knownURLs=', JSON.stringify(hist.entries.slice(0,2).map(e => e.url)));
+    let entry;
+
+    const floatPair = (handoff.firstQ && handoff.firstA) ? [
+      { timestamp: Date.now() - 1, role: 'user',      message: handoff.firstQ, context: handoff.selection || '' },
+      { timestamp: Date.now(),     role: 'assistant', message: handoff.firstA, context: '',
+        contextRefs: handoff.selection ? [{ text: handoff.selection, url: normUrl, title: handoff.title }] : [] },
+    ] : [];
+    HDBG('HANDOFF▶ floatPair.length=', floatPair.length);
+
+    if (entryIdx >= 0) {
+      entry = hist.entries[entryIdx];
+      const prevLen = entry.content ? entry.content.length : 0;
+      if (!entry.content) entry.content = [];
+      entry.content.push(...floatPair);
+      hist.entries.splice(entryIdx, 1);
+      hist.entries.unshift(entry);
+      HDBG('HANDOFF▶ merged into existing entry; content', prevLen, '→', entry.content.length);
+    } else {
+      entry = { url: normUrl, title: S.currentTitle || normUrl, context: [], content: [...floatPair], timestamp: Date.now() };
+      if (floatPair.length) hist.entries.unshift(entry);
+      HDBG('HANDOFF▶ NEW entry created; content.length=', entry.content.length);
     }
-    // Auto-send the second question
-    el.chatInp.value = handoff.secondQ;
-    updateMirror();
-    await sendChatMessage();
-  } catch(e) { ERR('onFloatHandoff failed', e); }
+
+    if (floatPair.length) {
+      S.suppressHistoryRender = true;
+      HDBG('HANDOFF▶ suppress=true; saving to storage…');
+      try {
+        await new Promise(r => chrome.storage.local.set({ [HISTORY_KEY]: hist }, r));
+        HDBG('HANDOFF▶ storage saved; entry.content.length=', entry.content.length);
+      } catch(saveErr) {
+        HDBG('HANDOFF✗ storage save FAILED:', saveErr);
+      }
+      HDBG('HANDOFF▶ calling openChatView; content.length=', entry.content.length);
+      openChatView(entry);
+      S.suppressHistoryRender = false;
+      HDBG('HANDOFF▶ suppress=false; openChatView done; S.view=', S.view);
+    } else {
+      HDBG('HANDOFF▶ no floatPair; openChatView for empty entry');
+      openChatView(entry);
+    }
+
+    autoCapturePageCtx().catch(() => {});
+
+    if (handoff.secondQ) {
+      HDBG('HANDOFF▶ auto-sending secondQ:', handoff.secondQ.slice(0, 40));
+      el.chatInp.value = handoff.secondQ;
+      updateMirror();
+      await sendChatMessage();
+    } else {
+      HDBG('HANDOFF▶ no secondQ — done');
+    }
+  } catch(e) { HDBG('HANDOFF✗ failed:', String(e)); }
+  finally { S.floatHandoffBusy = false; HDBG('HANDOFF▶ floatHandoffBusy cleared'); }
+}
+
+// Open sidebar with a pending float conversation (user opened sidebar manually while float had Q/A)
+async function onFloatPending(fp) {
+  LOG('PENDING▶ onFloatPending called; firstQ=', !!(fp && fp.firstQ), 'url=', fp && fp.url);
+  chrome.storage.session.remove('cwaFloatPending');
+  if (!fp || !fp.firstQ || !fp.firstA) { ERR('PENDING✗ missing firstQ/firstA'); return; }
+  try {
+    const normUrl  = normalizeUrl(fp.url || S.currentUrl);
+    S.currentUrl   = normUrl;
+    S.currentTitle = fp.title || S.currentTitle;
+
+    const hist     = await loadHistory();
+    let entryIdx   = hist.entries.findIndex(e => e.url === normUrl);
+    let entry;
+
+    const floatPair = [
+      { timestamp: Date.now() - 1, role: 'user',      message: fp.firstQ, context: fp.sel || '' },
+      { timestamp: Date.now(),     role: 'assistant', message: fp.firstA, context: '',
+        contextRefs: fp.sel ? [{ text: fp.sel, url: fp.url, title: fp.title }] : [] },
+    ];
+
+    if (entryIdx >= 0) {
+      entry = hist.entries[entryIdx];
+      if (!entry.content) entry.content = [];
+      entry.content.push(...floatPair);
+      hist.entries.splice(entryIdx, 1);
+      hist.entries.unshift(entry);
+    } else {
+      entry = { url: normUrl, title: S.currentTitle || normUrl, context: [], content: [...floatPair], timestamp: Date.now() };
+      hist.entries.unshift(entry);
+    }
+
+    S.suppressHistoryRender = true;
+    try {
+      await new Promise(r => chrome.storage.local.set({ [HISTORY_KEY]: hist }, r));
+    } catch(e2) { ERR('PENDING✗ storage save failed:', e2); }
+    LOG('PENDING▶ saved; calling openChatView; content.length=', entry.content.length);
+    openChatView(entry);
+    S.suppressHistoryRender = false;
+    autoCapturePageCtx().catch(() => {});
+  } catch(e) { ERR('PENDING✗ onFloatPending failed:', e); }
 }
 
 //  Textarea syntax highlight mirror 
@@ -357,13 +475,13 @@ function updateMirror() {
   // Tokenize: /word or /word-with-hyphens = cmd-token, @ctxId = ctx-token
   let html = '';
   let hasToken = false;
-  const parts = text.split(/((?:^|(?<=\s))\/[\w-]+|@(?:[a-f0-9]{6}|\d+\.\d+)\b)/g);
+  const parts = text.split(/((?:^|(?<=\s))\/[\w-]+|@(?:[a-f0-9]{6,8}(?:_[a-z0-9]+)?|\d+)\b)/g);
   parts.forEach(part => {
     if (!part) return;
     if (/^\/[\w-]+$/.test(part)) {
       html += '<span class="cmd-token">' + esc(part) + '</span>';
       hasToken = true;
-    } else if (/^@(?:[a-f0-9]{6}|\d+\.\d+)$/.test(part)) {
+    } else if (/^@(?:[a-f0-9]{6,8}(?:_[a-z0-9]+)?|\d+)$/.test(part)) {
       html += '<span class="ctx-token">' + esc(part) + '</span>';
       hasToken = true;
     } else {
@@ -432,25 +550,16 @@ function genPageUid(url) {
 }
 
 function initCtxIdCounters() {
-  S.ctxUrlToPage   = {};
-  S.ctxNextPageNum = 1;
-  for (const [id, ctx] of Object.entries(S.ctxStore)) {
-    const m = id.match(/^(\d+)\.\d+$/);
-    if (m) {
-      const page = parseInt(m[1], 10);
-      if (page >= S.ctxNextPageNum) S.ctxNextPageNum = page + 1;
-      if (ctx.url && !S.ctxUrlToPage[ctx.url]) S.ctxUrlToPage[ctx.url] = page;
-    }
+  S.ctxNextId = 1;
+  for (const id of Object.keys(S.ctxStore)) {
+    // Support both new integer format and legacy "X.Y" format
+    const n = parseInt(id, 10);
+    if (!isNaN(n) && n >= S.ctxNextId) S.ctxNextId = n + 1;
   }
 }
 
 function nextCtxId(url) {
-  if (!S.ctxUrlToPage[url]) {
-    S.ctxUrlToPage[url] = S.ctxNextPageNum++;
-  }
-  const pageNum = S.ctxUrlToPage[url];
-  const subIdx  = Object.values(S.ctxStore).filter(c => c.url === url).length;
-  return pageNum + '.' + subIdx;
+  return String(S.ctxNextId++);
 }
 
 // Auto-capture full page/PDF text as context X.0 when opening chat
@@ -490,8 +599,11 @@ async function autoCapturePageCtx() {
     if (!pageText) return;
     // Phase 0-A: cache full page text as { uid, text, title, createdAt }
     S.pageHtmlCache[url] = { uid: genPageUid(url), text: pageText, title: S.currentTitle || url, createdAt: Date.now() };
-    const id = nextCtxId(url);
-    S.ctxStore[id] = { text: pageText, url, title: S.currentTitle || url, createdAt: Date.now(), auto: true };
+    // Reuse existing context ID for this URL so it stays stable across sessions
+    const existingAutoId = Object.keys(S.ctxStore).find(k => S.ctxStore[k].url === url && S.ctxStore[k].auto);
+    const id = existingAutoId || nextCtxId(url);
+    const preservedCreatedAt = existingAutoId ? S.ctxStore[id].createdAt : Date.now();
+    S.ctxStore[id] = { text: pageText, url, title: S.currentTitle || url, createdAt: preservedCreatedAt, auto: true };
     S.autoCtxId = id;
     chrome.storage.local.get(CTX_STORE_KEY, d => {
       const store = d[CTX_STORE_KEY] || {};
@@ -505,7 +617,7 @@ async function autoCapturePageCtx() {
       inp.selectionStart = inp.selectionEnd = inp.value.length;
       updateMirror();
     }
-    LOG('auto-captured ctx:', id, 'chars:', pageText.length);
+    LOG('auto-captured ctx:', id, existingAutoId ? '(reused)' : '(new)', 'chars:', pageText.length);
   } catch(e) { ERR('auto-capture failed', e); }
 }
 
@@ -619,7 +731,6 @@ function checkInputHint() {
         frag.appendChild(item);
       });
       el.atHint.insertBefore(frag, el.atHint.firstChild);
-      el.ctxSearchPanel.style.display = 'none';
       showHintItems([...el.atHint.querySelectorAll('.at-hint-item')]);
       return;
     }
@@ -633,7 +744,12 @@ function checkInputHint() {
     const ownIds  = allIds.filter(id => S.ctxStore[id].url === S.currentUrl);
     const otherIds= allIds.filter(id => S.ctxStore[id].url !== S.currentUrl);
     const sortedIds = [...ownIds, ...otherIds];
-    const filtered = sortedIds.filter(id => !partial || id.startsWith(partial));
+    const filtered = sortedIds.filter(id => {
+      if (!partial) return true;
+      if (id.startsWith(partial)) return true;
+      const title = (S.ctxStore[id].title || '').toLowerCase();
+      return title.includes(partial);
+    });
     const top = filtered.slice(0, 8);
 
     if (top.length || partial === '') {
@@ -685,68 +801,12 @@ function checkInputHint() {
       });
       el.atHint.insertBefore(frag, el.atHint.firstChild);
 
-      // Show cross-URL search button if there are more contexts from other URLs
-      if (otherIds.length > 0 || top.length === 0) {
-        el.ctxSearchPanel.style.display = 'block';
-        el.ctxSearchInp.value = '';
-        el.ctxSearchRes.innerHTML = '';
-        el.ctxSearchInp.oninput = () => runCtxSearch(atM, val, pos);
-        el.ctxSearchInp.onkeydown = e => {
-          if (e.key === 'Enter') { e.preventDefault(); commitCtxSearch(atM, val, pos); }
-          if (e.key === 'Escape') hideAtHint();
-        };
-      } else {
-        el.ctxSearchPanel.style.display = 'none';
-      }
       showHintItems([...el.atHint.querySelectorAll('.at-hint-item')]);
       return;
     }
   }
 
   hideAtHint();
-}
-
-function runCtxSearch(atM, val, pos) {
-  const query = el.ctxSearchInp.value.toLowerCase().trim();
-  if (!query) { el.ctxSearchRes.innerHTML = ''; return; }
-  const words = query.split(/\s+/);
-  const results = Object.entries(S.ctxStore)
-    .filter(([, ctx]) => words.every(w => ctx.text.toLowerCase().includes(w)))
-    .slice(0, 5);
-  el.ctxSearchRes.innerHTML = '';
-  if (!results.length) {
-    el.ctxSearchRes.innerHTML = '<div style="font-size:10px;color:var(--fg3);padding:3px 8px">no matches</div>';
-    return;
-  }
-  S._searchResults = results;
-  S._searchSel = 0;
-  results.forEach(([id, ctx], i) => {
-    const item = document.createElement('div');
-    item.className = 'at-hint-item' + (i === 0 ? ' active' : '');
-    item.dataset.ctxId = id;
-    const preview = ctx.text.slice(0, 60) + (ctx.text.length > 60 ? '\u2026' : '');
-    const title = ctx.title ? esc(ctx.title.slice(0, 30)) + (ctx.title.length > 30 ? '…' : '') : 'no title';
-    item.innerHTML =
-      '<span class="at-hint-idx" style="color:#8888ff">@' + id + '</span>' +
-      '<span class="at-hint-text">' + title + ' <span style="color:var(--fg-dim)">—</span> ' + esc(preview) + '</span>';
-    item.addEventListener('mousedown', e => {
-      e.preventDefault();
-      insertCtxRef(id, atM, val, pos);
-    });
-    el.ctxSearchRes.appendChild(item);
-  });
-  el.ctxSearchInp.onkeydown = e => {
-    if (e.key === 'ArrowDown') { S._searchSel = Math.min(S._searchSel + 1, results.length - 1); updateSearchActive(); e.preventDefault(); return; }
-    if (e.key === 'ArrowUp')   { S._searchSel = Math.max(S._searchSel - 1, 0); updateSearchActive(); e.preventDefault(); return; }
-    if (e.key === 'Enter') { e.preventDefault(); insertCtxRef(results[S._searchSel][0], atM, val, pos); return; }
-    if (e.key === 'Escape') hideAtHint();
-  };
-}
-
-function updateSearchActive() {
-  [...el.ctxSearchRes.querySelectorAll('.at-hint-item')].forEach((item, i) => {
-    item.classList.toggle('active', i === S._searchSel);
-  });
 }
 
 function insertCtxRef(id, atM, val, pos) {
@@ -764,7 +824,6 @@ function insertCtxRef(id, atM, val, pos) {
 function hideAtHint() {
   el.atHint.style.display = 'none';
   el.atHint.querySelectorAll('.at-hint-item').forEach(n => n.remove());
-  el.ctxSearchPanel.style.display = 'none';
   S.hintIdx   = -1;
   S.hintItems = [];
 }
@@ -788,7 +847,7 @@ function parseInput(rawText) {
 
   // Resolve @ctxId references
   const resolvedCtxs = [];
-  const cleanText = textWithoutCmd.replace(/@([a-f0-9]{6}|\d+\.\d+)\b/g, (match, id) => {
+  const cleanText = textWithoutCmd.replace(/@([a-f0-9]{6,8}(?:_[a-z0-9]+)?|\d+)\b/g, (match, id) => {
     const ctx = S.ctxStore[id];
     if (ctx) {
       if (!resolvedCtxs.find(x => x.id === id)) resolvedCtxs.push({ id, text: ctx.text, context: ctx.text });
@@ -808,7 +867,16 @@ async function refreshCurrentTab() {
 }
 
 async function onTabNavigated(url, title) {
-  S.currentUrl   = normalizeUrl(url);
+  const newNorm = normalizeUrl(url);
+  LOG('onTabNavigated: newUrl=', newNorm, '| S.view=', S.view,
+      '| floatHandoffBusy=', !!S.floatHandoffBusy);
+  // If handoff is in progress, don't let tab navigation overwrite S.currentUrl
+  // or wipe the chat view being built by onFloatHandoff
+  if (S.floatHandoffBusy) {
+    LOG('onTabNavigated: SKIPPED — floatHandoffBusy is true');
+    return;
+  }
+  S.currentUrl   = newNorm;
   S.currentTitle = title;
   S.pendingSelections = [];
   S.autoCtxId = null;              // reset auto-ctx on URL change
@@ -851,10 +919,17 @@ async function onTabNavigated(url, title) {
 
 function onHistoryChanged(newHist) {
   if (!newHist) return;
-  if (S.suppressHistoryRender) return; // TRACE_SAVE in flight — don't wipe DOM annotations
+  if (S.suppressHistoryRender) {
+    HDBG('onHistoryChanged: SUPPRESSED; view=', S.view);
+    return;
+  }
+  HDBG('onHistoryChanged: FIRING; view=', S.view,
+      'currentEntry.url=', S.currentEntry && S.currentEntry.url,
+      'newHist entries=', (newHist.entries || []).length);
   if (S.view === 'list') { refreshList(newHist); return; }
   if (S.view === 'chat' && S.currentEntry) {
     const updated = (newHist.entries || []).find(e => e.url === S.currentEntry.url);
+    HDBG('onHistoryChanged: chat; updated=', !!updated, 'msgs=', updated ? (updated.content||[]).length : 'N/A');
     if (updated) { S.currentEntry = updated; renderChatMessages(updated.content || []); }
   }
 }
@@ -1129,6 +1204,8 @@ async function navigateToCurrent() {
 
 //  Chat view 
 function openChatView(entry) {
+  LOG('openChatView: url=', entry && entry.url,
+      '| content.length=', entry && entry.content ? entry.content.length : 0);
   S.view         = 'chat';
   S.currentEntry = entry;
   document.body.className = '';
@@ -1146,6 +1223,8 @@ function openChatView(entry) {
 }
 
 function renderChatMessages(content) {
+  LOG('renderChatMessages: content.length=', content.length,
+      '| caller=', new Error().stack.split('\n')[2].trim().slice(0, 80));
   el.chatMessages.innerHTML = '';
   if (!content.length) {
     el.chatMessages.innerHTML = '<div class="msg sys">NEW CONVERSATION \u2014 type below to start</div>';
@@ -1561,6 +1640,8 @@ function appendSearchResult(summary, sources, query) {
 }
 
 function backToList() {
+  LOG('backToList called; S.view=', S.view, '| floatHandoffBusy=', !!S.floatHandoffBusy,
+      '| caller=', new Error().stack.split('\n')[2].trim().slice(0, 80));
   S.selectedUrls.clear();
   document.body.className = '';
   showListView();

@@ -49,7 +49,6 @@
   },
   "commands": {
     "open-sidebar-capture": {
-      "suggested_key": { "default": "Alt+1" },
       "description": "Open Pluck sidebar and capture context"
     },
     "toggle-sidebar": {
