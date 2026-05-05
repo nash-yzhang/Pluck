@@ -25,7 +25,7 @@ const DEFAULT_PRESETS = {
   find:      'Search the page content for passages matching the user\'s description or keyword. Return ONLY verbatim quotes in double quotes — these will be auto-highlighted on the page. If nothing matches, output: not found.',
   define:    'Define the selected term or concept in 1–3 sentences. Precise and direct, no padding.',
   outline:   'Convert the selected content into a hierarchical outline. Minimal words per node. No prose.',
-  search:    'Search the web for the user\'s query. Output your best concise answer in 2–4 sentences, then include exactly one [SEARCH: optimized_search_query] tag at the end — the query should be precise and in English regardless of input language.',
+  search:    'Use web search results to answer. Respond in the same language and at the same level of detail (brief/detailed) as the user\'s question. Cite sources with [N].',
 };
 
 const S = {
@@ -1558,47 +1558,191 @@ function injectSuperscript(container, claim, num, evidence, src) {
   return false;
 }
 
-// ── Web search triggered by [SEARCH: ...] — async, saves to history ─────────
-function triggerWebSearch(query, linkEl) {
-  if (linkEl) {
-    linkEl.textContent = '\u23f3 searching\u2026';
-    linkEl.style.opacity = '0.6';
-    linkEl.style.pointerEvents = 'none';
-  }
-  chrome.runtime.sendMessage({ type: 'WEB_SEARCH', payload: { query } }, result => {
-    if (linkEl) {
-      linkEl.style.pointerEvents = '';
-      linkEl.style.opacity = '1';
-      if (!result || result.error) {
-        linkEl.textContent = '\u26a0 ' + (result && result.error ? result.error : 'search failed');
-        linkEl.style.color = '#cc3322';
-      } else {
-        linkEl.textContent = '\u2713 ' + query;
-      }
-    }
-    if (!result || result.error) return;
-    appendSearchResult(result.summary || '', result.sources || [], result.query || query);
-    // Save search result to history as a normal assistant message
-    const searchText = '\uD83D\uDD0D ' + (result.query || query) + '\n\n' + (result.summary || '');
-    const now = Date.now();
-    const searchMsg = { timestamp: now, role: 'assistant', message: searchText, context: '', isSearchResult: true };
-    if (S.currentEntry) {
-      if (!S.currentEntry.content) S.currentEntry.content = [];
-      S.currentEntry.content.push(searchMsg);
-    }
-    S.suppressHistoryRender = true;
-    chrome.runtime.sendMessage({
-      type: 'HISTORY_SAVE',
-      payload: {
-        url:         S.currentUrl,
-        title:       S.currentTitle || S.currentUrl,
-        userMessage: '',
-        aiReply:     searchText,
-        contextTexts: [],
-        contextRefs:  [],
-      },
-    }, () => { S.suppressHistoryRender = false; syncToDir().catch(() => {}); });
+// ── /search preset: 3-step flow (keywords → DDG → streaming answer) ────────
+async function runSearchFlow(text, dedupedSels, pageCtxText, resumeSummary, pageDeltaText) {
+  const entry = S.currentEntry;
+  const payloadUrl   = (entry && entry.url)   || S.currentUrl;
+  const payloadTitle = (entry && entry.title) || S.currentTitle || '';
+
+  // Show user message
+  const tsEl = document.createElement('div');
+  tsEl.className = 'msg-ts';
+  tsEl.textContent = fmtTime(Date.now());
+  el.chatMessages.appendChild(tsEl);
+  appendMsgEl('user', text, false, null);
+
+  const snapshotSels = dedupedSels.slice();
+  const traceSrcs = snapshotSels.map(s => {
+    const stored = s.id ? S.ctxStore[s.id] : null;
+    return {
+      text:  s.text,
+      url:   (stored && stored.url)   || payloadUrl || '',
+      title: (stored && stored.title) || payloadTitle || '',
+    };
   });
+
+  // Build history slice
+  const rawMsgs = entry && entry.content || [];
+  const msgSlice = resumeSummary ? rawMsgs.slice(-4) : rawMsgs.slice(-20);
+  const histMsgs = msgSlice.map(m => ({ role: m.role, content: m.message }));
+
+  const aiDiv = appendMsgEl('assistant', '', true, null);
+  let buf = '';
+
+  try {
+    // Step 1: generate search keywords via LLM
+    setStatus('waiting');
+    aiDiv._content.textContent = '\u231b getting search keywords\u2026';
+    const ctxHint = snapshotSels.length ? snapshotSels[0].text.slice(0, 300) : '';
+    const kwResult = await new Promise(resolve =>
+      chrome.runtime.sendMessage({ type: 'SEARCH_KEYWORDS', payload: { prompt: text, context: ctxHint } }, resolve)
+    );
+    if (!kwResult || kwResult.error) throw new Error(kwResult ? kwResult.error : 'keyword extraction failed');
+    const keywords = kwResult.keywords.trim();
+
+    // Step 2: DDG search
+    aiDiv._content.textContent = '\u231b searching: ' + keywords + '\u2026';
+    const searchResult = await new Promise(resolve =>
+      chrome.runtime.sendMessage({ type: 'WEB_SEARCH_RAW', payload: { query: keywords } }, resolve)
+    );
+    if (!searchResult || searchResult.error) throw new Error(searchResult ? searchResult.error : 'search failed');
+    const rawResults = searchResult.results || [];
+
+    // Step 3: stream answer with results injected as context
+    aiDiv._content.textContent = '';
+    setStatus('waiting');
+    const srcBlock = rawResults.map((r, i) =>
+      '[' + (i + 1) + '] ' + r.title + '\n' + r.url + '\n' + r.snippet
+    ).join('\n\n');
+    const searchCtx = '[Web Search for: ' + keywords + ']\n\n' + srcBlock;
+    const payload = {
+      prompt:     text,
+      url:        payloadUrl,
+      meta:       { title: payloadTitle, description: '' },
+      selections: [
+        ...snapshotSels.map(s => ({ text: s.text, context: s.context || s.text })),
+        { text: searchCtx, context: searchCtx },
+      ],
+      messages:   histMsgs,
+      model:      S.model,
+      presetInstruction: S.presets['search'] || null,
+      pageContext: pageCtxText,
+      resumeSummary: resumeSummary || undefined,
+      pageDelta: pageDeltaText || undefined,
+    };
+
+    await new Promise((resolve, reject) => {
+      const port = chrome.runtime.connect({ name: 'cwa' });
+      S.currentPort = port;
+      port.onMessage.addListener(msg => {
+        if (msg.type === 'CHUNK') {
+          buf += msg.chunk;
+          setStatus('streaming');
+          aiDiv._content.innerHTML = renderMarkdown(buf);
+          el.chatMessages.scrollTop = el.chatMessages.scrollHeight;
+          return;
+        }
+        port.disconnect();
+        if (msg.error) { reject(new Error(msg.error)); return; }
+        const reply = msg.reply || buf;
+        aiDiv._content.innerHTML = renderMarkdown(reply);
+        aiDiv.classList.remove('streaming');
+        // Minimal search marker at top of message
+        const marker = document.createElement('div');
+        marker.className = 'search-marker';
+        marker.textContent = '\uD83D\uDD0D ' + keywords;
+        aiDiv.insertBefore(marker, aiDiv.firstChild);
+        // Collapsible sources
+        if (rawResults.length) {
+          const fnWrap = document.createElement('div');
+          fnWrap.className = 'trace-footnotes';
+          const toggle = document.createElement('button');
+          toggle.className = 'trace-fn-toggle';
+          toggle.textContent = 'SOURCES (' + rawResults.length + ')';
+          const body = document.createElement('div');
+          body.className = 'trace-fn-body';
+          body.style.display = 'none';
+          toggle.addEventListener('click', () => {
+            const open = body.style.display !== 'none';
+            body.style.display = open ? 'none' : 'block';
+            toggle.classList.toggle('open', !open);
+          });
+          rawResults.forEach((src, i) => {
+            const row = document.createElement('div');
+            row.className = 'trace-fn-row';
+            const num = document.createElement('span');
+            num.className = 'trace-fn-num';
+            num.textContent = (i + 1) + '.';
+            const lnk = document.createElement('a');
+            lnk.href = '#';
+            lnk.className = 'search-src-link';
+            lnk.textContent = src.title || src.url;
+            lnk.title = src.url;
+            lnk.addEventListener('click', e => { e.preventDefault(); chrome.tabs.create({ url: src.url }); });
+            row.appendChild(num);
+            row.appendChild(lnk);
+            body.appendChild(row);
+          });
+          fnWrap.appendChild(toggle);
+          fnWrap.appendChild(body);
+          aiDiv.appendChild(fnWrap);
+        }
+        if (snapshotSels.length) appendCtxFooter(aiDiv, snapshotSels);
+        aiDiv._originalText = reply;
+        attachTraceButton(aiDiv, reply, traceSrcs);
+        el.chatMessages.scrollTop = el.chatMessages.scrollHeight;
+        if (snapshotSels.length > 0) S.lastCtxSels = snapshotSels.slice();
+        // Save to history with minimal [\uD83D\uDD0D kw] marker prefix
+        const markedReply = '[\uD83D\uDD0D ' + keywords + ']\n' + reply;
+        const now = Date.now();
+        const newMsgPair = [
+          { timestamp: now, role: 'user', message: text, context: snapshotSels.map(s => s.text).filter(Boolean).join(' | ') },
+          { timestamp: now + 1, role: 'assistant', message: markedReply, context: '', contextRefs: traceSrcs.map((ts, i) => ({ id: snapshotSels[i] ? snapshotSels[i].id : undefined, text: snapshotSels[i] ? snapshotSels[i].text : ts.text, context: snapshotSels[i] ? snapshotSels[i].context : ts.text, url: ts.url, title: ts.title })) },
+        ];
+        if (S.currentEntry) {
+          if (!S.currentEntry.content) S.currentEntry.content = [];
+          S.currentEntry.content.push(...newMsgPair);
+        } else {
+          S.currentEntry = { url: payloadUrl, title: payloadTitle || payloadUrl, context: [], content: newMsgPair };
+        }
+        S.suppressHistoryRender = true;
+        chrome.runtime.sendMessage({
+          type: 'HISTORY_SAVE',
+          payload: {
+            url: payloadUrl, title: payloadTitle || payloadUrl,
+            userMessage: text, aiReply: markedReply,
+            contextTexts: snapshotSels.map(s => s.text),
+            contextRefs: traceSrcs.map((ts, i) => ({
+              id: snapshotSels[i] ? snapshotSels[i].id : undefined,
+              text: snapshotSels[i] ? snapshotSels[i].text : ts.text,
+              context: snapshotSels[i] ? snapshotSels[i].context : ts.text,
+              url: ts.url, title: ts.title,
+            })),
+          },
+        }, () => { S.suppressHistoryRender = false; syncToDir().catch(() => {}); });
+        resolve();
+      });
+      port.onDisconnect.addListener(() => {
+        const err = chrome.runtime.lastError && chrome.runtime.lastError.message;
+        if (err) reject(new Error(err)); else resolve();
+      });
+      port.postMessage({ type: 'QUERY', payload });
+    });
+    setStatus('ready');
+  } catch(e) {
+    ERR(e.message);
+    aiDiv.className = 'msg error';
+    aiDiv._content.textContent = 'ERROR: ' + e.message;
+    aiDiv.classList.remove('streaming');
+    setStatus('error');
+  } finally {
+    S.chatBusy = false;
+    S.currentPort = null;
+    el.chatInp.disabled = false;
+    el.chatSend.textContent = '\u25b6';
+    el.chatSend.title = 'Send (Enter)';
+    el.chatInp.focus();
+  }
 }
 
 function appendSearchResult(summary, sources, query) {
@@ -1757,6 +1901,11 @@ async function sendChatMessage() {
     }
   } catch(_) {}
 
+  // /search preset: 3-step flow (keywords → DDG → streaming answer)
+  if (presetKey === 'search') {
+    return runSearchFlow(text, dedupedSels, pageCtxText, resumeSummary, pageDeltaText);
+  }
+
   const tsEl = document.createElement('div');
   tsEl.className = 'msg-ts';
   tsEl.textContent = fmtTime(Date.now());
@@ -1812,17 +1961,6 @@ async function sendChatMessage() {
         const reply = msg.reply || buf;
         aiDiv._content.innerHTML = renderMarkdown(reply);
         aiDiv.classList.remove('streaming');
-        // Auto-trigger any [SEARCH: ...] pills present in the response (async, background)
-        aiDiv._content.querySelectorAll('a.search-link[data-search-query]').forEach(link => {
-          if (link.dataset.autoTriggered) return;
-          link.dataset.autoTriggered = '1';
-          triggerWebSearch(link.dataset.searchQuery, link);
-        });
-        // For /search preset: remove pill markup from displayed reply (search runs in background)
-        if (presetKey === 'search') {
-          const cleaned = (aiDiv._content.innerHTML || '').replace(/<a[^>]+class="search-link"[^>]*>[^<]*<\/a>/g, '').trim();
-          if (cleaned !== aiDiv._content.innerHTML) aiDiv._content.innerHTML = cleaned;
-        }
         // Super Ctrl+F: auto-highlight quoted matches returned by /find
         if (presetKey === 'find' && reply) {
           const quotes = [];

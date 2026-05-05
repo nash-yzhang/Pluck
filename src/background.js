@@ -46,8 +46,7 @@ function buildMessages(payload, provider) {
     '- Use the page URL and title to infer context instantly.\n' +
     '- [Key] marks text the user highlighted — treat it as the primary focus.\n' +
     '- [Context] is the surrounding element/page content for reference.\n' +
-    '- Answer in the same language the user writes in.\n' +
-    '- When a web search would meaningfully help, include [SEARCH: specific query] anywhere in your reply.';
+    '- Answer in the same language the user writes in.';
 
   if (payload.presetInstruction) {
     baseSystem += '\n\nUser-selected instruction (apply to this response): ' + payload.presetInstruction;
@@ -279,6 +278,36 @@ async function requestAnthropicJson(apiKey, body) {
   });
   if (!response.ok) throw new Error(await parseProviderError(response, 'Claude'));
   return response.json();
+}
+
+// ── DuckDuckGo HTML scraper (shared by WEB_SEARCH and WEB_SEARCH_RAW) ───────
+async function scrapeDDG(query) {
+  const r = await fetch(
+    'https://html.duckduckgo.com/html/?q=' + encodeURIComponent(query),
+    {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml',
+        'Accept-Language': 'en-US,en;q=0.9',
+      },
+    }
+  );
+  if (!r.ok) throw new Error('DuckDuckGo fetch failed: ' + r.status);
+  const html = await r.text();
+  const results = [];
+  const blockRe = /<a[^>]+class="result__a"[^>]*href="([^"]*)"[^>]*>([\s\S]*?)<\/a>[\s\S]*?<a[^>]+class="result__snippet"[^>]*>([\s\S]*?)<\/a>/g;
+  let m;
+  while ((m = blockRe.exec(html)) !== null && results.length < 6) {
+    const rawHref = m[1];
+    const title   = m[2].replace(/<[^>]+>/g, '').trim();
+    const snippet = m[3].replace(/<[^>]+>/g, '').trim();
+    let url = rawHref;
+    const uddgMatch = rawHref.match(/[?&]uddg=([^&]+)/);
+    if (uddgMatch) url = decodeURIComponent(uddgMatch[1]);
+    else if (rawHref.startsWith('//')) url = 'https:' + rawHref;
+    if (title && snippet) results.push({ title, url, snippet });
+  }
+  return results;
 }
 
 // ── Port-based streaming (QUERY) ───────────────────────────────────────────
@@ -571,6 +600,60 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
     return false; // respond() already called synchronously
   }
 
+  // ── Web search: raw DDG results only (no LLM summary) ──────────────────
+  if (msg.type === 'WEB_SEARCH_RAW') {
+    (async () => {
+      const { query } = msg.payload;
+      try {
+        const results = await scrapeDDG(query);
+        if (!results.length) { respond({ error: 'No results from DuckDuckGo.' }); return; }
+        respond({ results, query });
+      } catch(e) {
+        ERR('WEB_SEARCH_RAW error:', e.message);
+        respond({ error: e.message });
+      }
+    })();
+    return true;
+  }
+
+  // ── Extract search keywords via LLM (non-streaming) ──────────────────────
+  if (msg.type === 'SEARCH_KEYWORDS') {
+    (async () => {
+      const { apiKey, model, provider } = await getConfig();
+      if (!apiKey) { respond({ error: 'No API key.' }); return; }
+      const { prompt, context } = msg.payload;
+      const userMsg = context
+        ? 'Page context: ' + context + '\n\nUser question: ' + prompt
+        : 'User question: ' + prompt;
+      const systemPrompt = 'Output only a comma-separated list of 3-6 precise English search keywords for the user question. No explanation, no extra text.';
+      try {
+        let keywords = '';
+        if (provider === 'claude') {
+          const data = await requestAnthropicJson(apiKey, {
+            model, max_tokens: 60,
+            system: systemPrompt,
+            messages: [{ role: 'user', content: userMsg }],
+          });
+          keywords = ((data.content || []).map(p => p.text || '').join('')).trim();
+        } else {
+          const data = await requestOpenAICompatibleJson(provider, apiKey, {
+            model, stream: false, max_completion_tokens: 60,
+            messages: [
+              { role: 'system', content: systemPrompt },
+              { role: 'user', content: userMsg },
+            ],
+          });
+          keywords = (data.choices[0].message.content || '').trim();
+        }
+        respond({ keywords });
+      } catch(e) {
+        ERR('SEARCH_KEYWORDS error:', e.message);
+        respond({ error: e.message });
+      }
+    })();
+    return true;
+  }
+
   // ── Web search with LLM-cited summary ──────────────────────────────────
   if (msg.type === 'WEB_SEARCH') {
     (async () => {
@@ -578,33 +661,7 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
       if (!apiKey) { respond({ error: 'No LLM API key set.' }); return; }
       const { query } = msg.payload;
       try {
-        // DuckDuckGo HTML scrape — no API key required
-        const ddgUrl = 'https://html.duckduckgo.com/html/?q=' + encodeURIComponent(query);
-        const r = await fetch(ddgUrl, {
-          headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml',
-            'Accept-Language': 'en-US,en;q=0.9',
-          },
-        });
-        if (!r.ok) throw new Error('DuckDuckGo fetch failed: ' + r.status);
-        const html = await r.text();
-
-        // Extract results: title from <a class="result__a">, snippet from result__snippet,
-        // URL from uddg= param inside the href
-        const results = [];
-        const blockRe = /<a[^>]+class="result__a"[^>]*href="([^"]*)"[^>]*>([\s\S]*?)<\/a>[\s\S]*?<a[^>]+class="result__snippet"[^>]*>([\s\S]*?)<\/a>/g;
-        let m;
-        while ((m = blockRe.exec(html)) !== null && results.length < 6) {
-          const rawHref = m[1];
-          const title   = m[2].replace(/<[^>]+>/g, '').trim();
-          const snippet = m[3].replace(/<[^>]+>/g, '').trim();
-          let url = rawHref;
-          const uddgMatch = rawHref.match(/[?&]uddg=([^&]+)/);
-          if (uddgMatch) url = decodeURIComponent(uddgMatch[1]);
-          else if (rawHref.startsWith('//')) url = 'https:' + rawHref;
-          if (title && snippet) results.push({ title, url, snippet });
-        }
+        const results = await scrapeDDG(query);
         if (!results.length) { respond({ error: 'No results from DuckDuckGo.' }); return; }
 
         const srcBlock = results.map((r, i) =>
