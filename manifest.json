@@ -55,6 +55,10 @@
     "toggle-sidebar": {
       "suggested_key": { "default": "Alt+K" },
       "description": "Toggle Pluck sidebar open/closed"
+    },
+    "find-on-page": {
+      "suggested_key": { "default": "Alt+S" },
+      "description": "Open floating find panel with AI fallback"
     }
   }
 }

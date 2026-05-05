@@ -22,7 +22,7 @@ const DEFAULT_PRESETS = {
   rephrase:  'Give 3–5 alternative phrasings of the selected text. Cover: simpler, more formal, more concise, casual. Label each variant with one word. No explanations.',
   grammar:   'List only the grammatical errors in the selected text. Format each as: [original] → [correction]. No other output.',
   keywords:  'Generate precise search keyword candidates from the selected text to expand information retrieval. Include exact phrases, synonyms, and related terms. Compact list only.',
-  find:      'The user\'s prompt is a fuzzy description of something. Search the selected text for matching information. Return direct quotes only so the user can Ctrl+F to locate them. If nothing matches, output: not found.',
+  find:      'Search the page content for passages matching the user\'s description or keyword. Return ONLY verbatim quotes in double quotes — these will be auto-highlighted on the page. If nothing matches, output: not found.',
   define:    'Define the selected term or concept in 1–3 sentences. Precise and direct, no padding.',
   outline:   'Convert the selected content into a hierarchical outline. Minimal words per node. No prose.',
 };
@@ -49,6 +49,8 @@ const S = {
   autoCtxId:         null,  // ID of auto-captured full-page ctx for current URL
   ctxUrlToPage:      {},   // { [url]: pageNum } for sequential IDs
   ctxNextPageNum:    1,    // next global page number
+  pageHtmlCache:     {},   // { [url]: { uid, text, title, createdAt } } — session-level page text cache
+  resumeCache:       {},   // { [url]: string } — LLM session resume summaries (persisted)
 };
 
 const $  = id => document.getElementById(id);
@@ -190,6 +192,15 @@ async function init() {
   });
 
   el.chatSend.addEventListener('click', sendChatMessage);
+
+  // Web search pill click — triggered by [SEARCH: ...] links in AI replies
+  el.chatMessages.addEventListener('click', e => {
+    const link = e.target.closest('a.search-link[data-search-query]');
+    if (!link) return;
+    e.preventDefault();
+    const query = link.dataset.searchQuery;
+    if (query) triggerWebSearch(query, link);
+  });
   el.chatInp.addEventListener('keydown', e => {
     // hint dropdown keyboard nav
     if (el.atHint.style.display !== 'none' && S.hintItems.length) {
@@ -225,6 +236,11 @@ async function init() {
   S.ctxStore = ctxData[CTX_STORE_KEY] || {};
   LOG('ctxStore loaded:', Object.keys(S.ctxStore).length, 'items');
   initCtxIdCounters();
+
+  // Phase 0-C: load persisted resume summaries
+  const resumeData = await new Promise(r => chrome.storage.local.get('cwaResumeCache', r));
+  S.resumeCache = resumeData.cwaResumeCache || {};
+  LOG('resumeCache loaded:', Object.keys(S.resumeCache).length, 'entries');
 
   renderPresetBar();
   await refreshCurrentTab();
@@ -275,17 +291,19 @@ async function init() {
 
   // Race-condition fix: background may have set cwaGoCapture BEFORE this listener was registered
   // (common when sidepanel was just opened by the Alt+1 command). Replay any pending keys.
-  chrome.storage.session.get(['cwaGoCapture', 'cwaGoChat', 'cwaSelMsg'], pending => {
+  chrome.storage.session.get(['cwaGoCapture', 'cwaGoChat', 'cwaSelMsg', 'cwaFloatHandoff'], pending => {
     LOG('DEBUG init: checking pending session keys on startup',
         'cwaGoCapture=', !!pending.cwaGoCapture,
         'cwaGoChat=', !!pending.cwaGoChat,
-        'cwaSelMsg=', !!pending.cwaSelMsg);
+        'cwaSelMsg=', !!pending.cwaSelMsg,
+        'cwaFloatHandoff=', !!pending.cwaFloatHandoff);
     if (pending.cwaGoCapture) {
       LOG('DEBUG init: replaying missed cwaGoCapture', JSON.stringify(pending.cwaGoCapture));
       onGoCapture(pending.cwaGoCapture);
     }
     if (pending.cwaGoChat) navigateToCurrent();
     if (pending.cwaSelMsg) onSelMsg(pending.cwaSelMsg);
+    if (pending.cwaFloatHandoff) onFloatHandoff(pending.cwaFloatHandoff);
   });
 
   LOG('init');
@@ -293,6 +311,40 @@ async function init() {
 
 //  Preset bar (hidden — presets activated via /cmd inline text) 
 function renderPresetBar() { /* no-op: presets now via /cmd in input */ }
+
+// Phase 2-C: receive float handoff — pre-populate chat with first Q/A then auto-send second Q
+async function onFloatHandoff(handoff) {
+  chrome.storage.session.remove('cwaFloatHandoff');
+  if (!handoff || !handoff.secondQ) return;
+  try {
+    // Navigate to chat view for the correct URL
+    S.currentUrl   = handoff.url   || S.currentUrl;
+    S.currentTitle = handoff.title || S.currentTitle;
+    await navigateToCurrent();
+    // Pre-populate history with the two float turns
+    if (handoff.firstQ && handoff.firstA) {
+      appendMsgEl('user',      handoff.firstQ, false, null);
+      appendMsgEl('assistant', handoff.firstA, false,
+        handoff.selection ? [{ text: handoff.selection, url: handoff.url, title: handoff.title }] : null);
+      // Persist the two turns into S.currentEntry so they count as history
+      const floatPair = [
+        { timestamp: Date.now() - 1, role: 'user',      message: handoff.firstQ,  context: handoff.selection || '' },
+        { timestamp: Date.now(),     role: 'assistant', message: handoff.firstA,  context: '',
+          contextRefs: handoff.selection ? [{ text: handoff.selection, url: handoff.url, title: handoff.title }] : [] },
+      ];
+      if (S.currentEntry) {
+        if (!S.currentEntry.content) S.currentEntry.content = [];
+        S.currentEntry.content.push(...floatPair);
+      } else {
+        S.currentEntry = { url: handoff.url, title: handoff.title || handoff.url, context: [], content: floatPair };
+      }
+    }
+    // Auto-send the second question
+    el.chatInp.value = handoff.secondQ;
+    updateMirror();
+    await sendChatMessage();
+  } catch(e) { ERR('onFloatHandoff failed', e); }
+}
 
 //  Textarea syntax highlight mirror 
 function updateMirror() {
@@ -371,6 +423,14 @@ async function onGoCapture(msg) {
   }
 }
 
+// Phase 0-A: generate per-page UID: 8-hex-char url hash + '_' + timestamp base36
+function genPageUid(url) {
+  let h = 5381;
+  const len = Math.min((url || '').length, 200);
+  for (let i = 0; i < len; i++) { h = ((h << 5) + h) ^ url.charCodeAt(i); h = h >>> 0; }
+  return h.toString(16).padStart(8, '0') + '_' + Date.now().toString(36);
+}
+
 function initCtxIdCounters() {
   S.ctxUrlToPage   = {};
   S.ctxNextPageNum = 1;
@@ -422,12 +482,14 @@ async function autoCapturePageCtx() {
       try {
         const results = await chrome.scripting.executeScript({
           target: { tabId: tab.id },
-          func: () => (document.body && document.body.innerText || '').trim().slice(0, 8000),
+          func: () => (document.body && document.body.innerText || '').trim().slice(0, 30000),
         });
         pageText = (results && results[0] && results[0].result) || '';
       } catch(e) { return; }
     }
     if (!pageText) return;
+    // Phase 0-A: cache full page text as { uid, text, title, createdAt }
+    S.pageHtmlCache[url] = { uid: genPageUid(url), text: pageText, title: S.currentTitle || url, createdAt: Date.now() };
     const id = nextCtxId(url);
     S.ctxStore[id] = { text: pageText, url, title: S.currentTitle || url, createdAt: Date.now(), auto: true };
     S.autoCtxId = id;
@@ -585,15 +647,27 @@ function checkInputHint() {
         const isOwn = ctx.url === S.currentUrl;
         const preview = ctx.text.slice(0, 40) + (ctx.text.length > 40 ? '\u2026' : '');
         const title = ctx.title ? esc(ctx.title.slice(0, 30)) + (ctx.title.length > 30 ? '…' : '') : 'no title';
+        // Phase 0-A: for auto-captured page entries show title · HH:MM DD/MM instead of raw preview
+        let labelText;
+        if (ctx.auto && ctx.createdAt) {
+          const d = new Date(ctx.createdAt);
+          const hhmm = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+          const ddmm = d.toLocaleDateString([], { day: '2-digit', month: '2-digit' });
+          labelText = title + ' \u00b7 ' + hhmm + ' ' + ddmm;
+        } else {
+          labelText = title + ' <span style="color:var(--fg-dim)">\u2014</span> ' + esc(preview);
+        }
         item.innerHTML =
           '<span class="at-hint-idx" style="color:' + (isOwn ? 'var(--accent)' : '#8888ff') + '">@' + id + '</span>' +
-          '<span class="at-hint-text">' + title + ' <span style="color:var(--fg-dim)">—</span> ' + esc(preview) + '</span>';
-        // Hover: expand preview
+          '<span class="at-hint-text">' + labelText + '</span>';
+        // Hover: expand preview (only for non-auto entries)
         item.addEventListener('mouseover', () => {
+          if (ctx.auto) return;
           const expandedPreview = ctx.text.slice(0, 120) + (ctx.text.length > 120 ? '\u2026' : '');
           item.querySelector('.at-hint-text').innerHTML = title + ' <span style="color:var(--fg-dim)">—</span> ' + esc(expandedPreview);
         });
         item.addEventListener('mouseleave', () => {
+          if (ctx.auto) return;
           item.querySelector('.at-hint-text').innerHTML = title + ' <span style="color:var(--fg-dim)">—</span> ' + esc(preview);
         });
         item.addEventListener('mousedown', e => {
@@ -696,16 +770,18 @@ function hideAtHint() {
 }
 
 // Resolve @ctxId refs and /cmd presets from input text
-// Returns { cleanText, resolvedCtxs, presetInstruction }
+// Returns { cleanText, resolvedCtxs, presetInstruction, presetKey }
 function parseInput(rawText) {
   // Extract /cmd (first occurrence, anywhere in text)
   let presetInstruction = null;
+  let presetKey = null;
   let textWithoutCmd = rawText;
   const cmdM = rawText.match(/(^|\s)\/([\w-]+)(\s|$)/);
   if (cmdM) {
     const key = cmdM[2];
     if (S.presets[key]) {
       presetInstruction = S.presets[key];
+      presetKey = key;
       textWithoutCmd = rawText.replace(cmdM[0], cmdM[1] || cmdM[3] ? ' ' : '').trim();
     }
   }
@@ -721,7 +797,7 @@ function parseInput(rawText) {
     return match;
   }).replace(/\s{2,}/g, ' ').trim();
 
-  return { cleanText: cleanText || textWithoutCmd, resolvedCtxs, presetInstruction };
+  return { cleanText: cleanText || textWithoutCmd, resolvedCtxs, presetInstruction, presetKey };
 }
 
 //  Tab helpers 
@@ -735,11 +811,31 @@ async function onTabNavigated(url, title) {
   S.currentUrl   = normalizeUrl(url);
   S.currentTitle = title;
   S.pendingSelections = [];
-  S.autoCtxId = null;   // reset auto-ctx on URL change
+  S.autoCtxId = null;              // reset auto-ctx on URL change
+  delete S.pageHtmlCache[S.currentUrl];  // Phase 0-A: invalidate stale cache so autoCapturePageCtx re-runs
   updateCurrentBar();
 
   const hist  = await loadHistory();
   const entry = hist.entries.find(e => e.url === S.currentUrl);
+
+  // Phase 0-C: trigger resume summary if ≥4 messages exist and no summary cached
+  if (entry && entry.content && entry.content.length >= 4 && !S.resumeCache[S.currentUrl]) {
+    const normUrl = S.currentUrl;
+    const lastMsgs = entry.content.slice(-8).map(m => ({ role: m.role, content: m.message }));
+    chrome.runtime.sendMessage({
+      type: 'RESUME_SUMMARIZE',
+      payload: { messages: lastMsgs, url: normUrl },
+    }, resp => {
+      if (resp && resp.summary) {
+        S.resumeCache[normUrl] = resp.summary;
+        chrome.storage.local.get('cwaResumeCache', d => {
+          const cache = d.cwaResumeCache || {};
+          cache[normUrl] = resp.summary;
+          chrome.storage.local.set({ cwaResumeCache: cache });
+        });
+      }
+    });
+  }
 
   if (S.view === 'chat') {
     if (!S.currentEntry) { backToList(); return; }
@@ -1374,8 +1470,97 @@ function injectSuperscript(container, claim, num, evidence, src) {
   return false;
 }
 
+// ── Web search triggered by [SEARCH: ...] pill ────────────────────────────
+function triggerWebSearch(query, linkEl) {
+  linkEl.textContent = '\u23f3 searching\u2026';
+  linkEl.style.opacity = '0.6';
+  linkEl.style.pointerEvents = 'none';
+  chrome.runtime.sendMessage({ type: 'WEB_SEARCH', payload: { query } }, result => {
+    linkEl.style.pointerEvents = '';
+    linkEl.style.opacity = '1';
+    if (!result || result.error) {
+      linkEl.textContent = '\u26a0 ' + (result && result.error ? result.error : 'search failed');
+      linkEl.style.color = '#cc3322';
+      return;
+    }
+    linkEl.textContent = '\u2713 ' + query;
+    appendSearchResult(result.summary || '', result.sources || [], result.query || query);
+  });
+}
+
+function appendSearchResult(summary, sources, query) {
+  const wrap = document.createElement('div');
+  wrap.className = 'msg assistant search-result-msg';
+
+  const hdr = document.createElement('div');
+  hdr.className = 'search-result-header';
+  hdr.textContent = '\ud83d\udd0d ' + query;
+  wrap.appendChild(hdr);
+
+  const content = document.createElement('span');
+  content.className = 'msg-content';
+
+  // Render summary markdown, then replace [N] with clickable superscripts
+  let html = renderMarkdown(summary);
+  html = html.replace(/\[(\d+)\]/g, function(_, n) {
+    const idx = parseInt(n, 10) - 1;
+    const src = sources && sources[idx];
+    const titleAttr = src ? escAttr(src.title || src.url) : '';
+    const urlAttr   = src ? escAttr(src.url) : '';
+    return '<sup class="search-cite" data-url="' + urlAttr + '" title="' + titleAttr + '">[' + n + ']</sup>';
+  });
+  content.innerHTML = html;
+
+  // Wire superscript citation clicks to open source URL
+  content.querySelectorAll('.search-cite[data-url]').forEach(sup => {
+    sup.addEventListener('click', () => {
+      const url = sup.dataset.url;
+      if (url) chrome.tabs.create({ url });
+    });
+  });
+  wrap.appendChild(content);
+
+  // Collapsible SOURCES block (reuse trace-footnotes styles)
+  if (sources && sources.length) {
+    const fnWrap = document.createElement('div');
+    fnWrap.className = 'trace-footnotes';
+    const toggle = document.createElement('button');
+    toggle.className = 'trace-fn-toggle';
+    toggle.textContent = 'SOURCES (' + sources.length + ')';
+    const body = document.createElement('div');
+    body.className = 'trace-fn-body';
+    body.style.display = 'none';
+    toggle.addEventListener('click', () => {
+      const open = body.style.display !== 'none';
+      body.style.display = open ? 'none' : 'block';
+      toggle.classList.toggle('open', !open);
+    });
+    sources.forEach((src, i) => {
+      const row = document.createElement('div');
+      row.className = 'trace-fn-row';
+      const num = document.createElement('span');
+      num.className = 'trace-fn-num';
+      num.textContent = (i + 1) + '.';
+      const lnk = document.createElement('a');
+      lnk.href = '#';
+      lnk.className = 'search-src-link';
+      lnk.textContent = src.title || src.url;
+      lnk.title = src.url;
+      lnk.addEventListener('click', e => { e.preventDefault(); chrome.tabs.create({ url: src.url }); });
+      row.appendChild(num);
+      row.appendChild(lnk);
+      body.appendChild(row);
+    });
+    fnWrap.appendChild(toggle);
+    fnWrap.appendChild(body);
+    wrap.appendChild(fnWrap);
+  }
+
+  el.chatMessages.appendChild(wrap);
+  el.chatMessages.scrollTop = el.chatMessages.scrollHeight;
+}
+
 function backToList() {
-  S.currentEntry = null;
   S.selectedUrls.clear();
   document.body.className = '';
   showListView();
@@ -1387,7 +1572,7 @@ async function sendChatMessage() {
   if (!rawText || S.chatBusy) return;
   hideAtHint();
 
-  const { cleanText, resolvedCtxs, presetInstruction } = parseInput(rawText);
+  const { cleanText, resolvedCtxs, presetInstruction, presetKey } = parseInput(rawText);
   const text = cleanText;
 
   // Merge legacy pending + resolved @ctxId selections
@@ -1399,8 +1584,17 @@ async function sendChatMessage() {
     S.lastCtxSels.forEach(s => allSels.push(s));
   }
 
-  // Req 2: if still no context, capture full page text as fallback
-  if (allSels.length === 0) {
+  // Phase 0-A: full page text cached as { uid, text, title, createdAt }
+  const pageCtxCache = S.pageHtmlCache[S.currentUrl];
+  const pageCtxText = pageCtxCache ? pageCtxCache.text : null;
+
+  // Deduplicate: if a selection is identical to the cached page text it's redundant (already in system)
+  let dedupedSels = pageCtxText
+    ? allSels.filter(s => s.text !== pageCtxText)
+    : allSels.slice();
+
+  // Req 2: scripting fallback only when no explicit selections AND no cached page context
+  if (dedupedSels.length === 0 && !pageCtxText) {
     try {
       const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
       if (tab && tab.id) {
@@ -1408,13 +1602,12 @@ async function sendChatMessage() {
         const isPdf  = /\.pdf(\?.*)?$/i.test(tabUrl) ||
                        tabUrl.startsWith('chrome-extension://mhjfbmdgcfjbbpaeojofohoefgiehjai/');
         if (isPdf) {
-          // PDF pages: scripting.executeScript won't work; fetch + parse instead
           try {
             const pdfUrl = isPdf && tabUrl.startsWith('chrome-extension://')
               ? new URL(tabUrl).searchParams.get('url') || tabUrl
               : tabUrl;
             const pageText = await extractPdfText(pdfUrl);
-            if (pageText) allSels.push({ text: '[PDF] ' + pageText, context: pageText });
+            if (pageText) dedupedSels.push({ text: '[PDF] ' + pageText, context: pageText });
           } catch(pe) { ERR('PDF extract failed', pe); }
         } else {
           const results = await chrome.scripting.executeScript({
@@ -1422,7 +1615,7 @@ async function sendChatMessage() {
             func: () => (document.body && document.body.innerText || '').trim().slice(0, 5000),
           });
           const pageText = results && results[0] && results[0].result;
-          if (pageText) allSels.push({ text: pageText, context: pageText });
+          if (pageText) dedupedSels.push({ text: pageText, context: pageText });
         }
       }
     } catch(e) { ERR('page text capture failed', e); }
@@ -1435,6 +1628,19 @@ async function sendChatMessage() {
   el.chatInp.disabled = true;
   el.chatSend.disabled = true;
 
+  // Phase 0-C: use resume summary to trim history when available
+  const resumeSummary = S.resumeCache[S.currentUrl] || null;
+
+  // Phase 0-B: consume accumulated SPA page delta from content script
+  let pageDeltaText = null;
+  try {
+    const deltaSess = await new Promise(r => chrome.storage.session.get('cwaPageDelta', r));
+    if (deltaSess.cwaPageDelta && deltaSess.cwaPageDelta.url === (S.currentUrl || '')) {
+      pageDeltaText = deltaSess.cwaPageDelta.text || null;
+      chrome.storage.session.remove('cwaPageDelta');
+    }
+  } catch(_) {}
+
   const tsEl = document.createElement('div');
   tsEl.className = 'msg-ts';
   tsEl.textContent = fmtTime(Date.now());
@@ -1442,19 +1648,25 @@ async function sendChatMessage() {
   appendMsgEl('user', text, false, null);
 
   const entry    = S.currentEntry;
-  const histMsgs = (entry && entry.content || []).slice(-20).map(m => ({ role: m.role, content: m.message }));
+  // Phase 0-C: when resume summary exists, only keep last 2 turns to reduce token cost
+  const rawMsgs = entry && entry.content || [];
+  const msgSlice = resumeSummary ? rawMsgs.slice(-4) : rawMsgs.slice(-20);
+  const histMsgs = msgSlice.map(m => ({ role: m.role, content: m.message }));
 
   const payload = {
     prompt:     text,
     url:        (entry && entry.url)   || S.currentUrl,
     meta:       { title: (entry && entry.title) || S.currentTitle || '', description: '' },
-    selections: allSels.map(s => ({ text: s.text, context: s.context || s.text })),
+    selections: dedupedSels.map(s => ({ text: s.text, context: s.context || s.text })),
     messages:   histMsgs,
     model:      S.model,
     presetInstruction: presetInstruction || null,
+    pageContext: pageCtxText,   // full page text → system-level caching, not repeated in user messages
+    resumeSummary: resumeSummary || undefined,  // Phase 0-C
+    pageDelta: pageDeltaText || undefined,       // Phase 0-B
   };
 
-  const snapshotSels = allSels.slice();
+  const snapshotSels = dedupedSels.slice();
   const traceSrcs = snapshotSels.map(s => {
     const stored = s.id ? S.ctxStore[s.id] : null;
     return {
@@ -1483,6 +1695,18 @@ async function sendChatMessage() {
         const reply = msg.reply || buf;
         aiDiv._content.innerHTML = renderMarkdown(reply);
         aiDiv.classList.remove('streaming');
+        // Super Ctrl+F: auto-highlight quoted matches returned by /find
+        if (presetKey === 'find' && reply) {
+          const quotes = [];
+          const qRe = /"([^"]{5,200})"/g;
+          let qm;
+          while ((qm = qRe.exec(reply)) !== null) quotes.push(qm[1]);
+          if (quotes.length) {
+            chrome.tabs.query({ active: true, currentWindow: true }, tabs => {
+              if (tabs[0]) chrome.tabs.sendMessage(tabs[0].id, { type: 'HIGHLIGHT_TRACES', snippets: quotes }).catch(() => {});
+            });
+          }
+        }
         if (snapshotSels.length) appendCtxFooter(aiDiv, snapshotSels);
         aiDiv._originalText = reply;
         attachTraceButton(aiDiv, reply, traceSrcs);
@@ -1594,6 +1818,12 @@ function renderMarkdown(raw) {
   t = t.replace(/((?:^\d+\. .+\n?)+)/gm, m => '<ol>' + m.trim().split('\n').map(l=>'<li>'+l.replace(/^\d+\. /,'')+'</li>').join('') + '</ol>');
   t = t.split(/\n{2,}/).map(c => { c = c.trim(); if (!c) return ''; if (/^<(h[1-3]|ul|ol|pre|hr|blockquote)/.test(c)) return c; return '<p>'+c.replace(/\n/g,'<br>')+'</p>'; }).join('\n');
   t = t.replace(/\x00BLOCK(\d+)\x00/g, (_, i) => blocks[+i]);
+  // [SEARCH: query] → pill button that triggers in-panel web search (no external redirect)
+  t = t.replace(/\[SEARCH:\s*([^\]]{3,120})\]/gi, (_, q) => {
+    const display = q.trim();
+    const raw = display.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>');
+    return '<a class="search-link" href="#" data-search-query="' + escAttr(raw) + '">&#128269; ' + display + '</a>';
+  });
   return t;
 }
 function esc(s)     { return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }

@@ -472,3 +472,26 @@ document.getElementById('import-file').addEventListener('change', function(e) {
   reader.readAsText(file);
   e.target.value = '';
 });
+
+// ── Search API settings ────────────────────────────────────────────────────────
+chrome.storage.sync.get(['cwaSearchApiKey', 'cwaSearchProvider'], function(r) {
+  if (r.cwaSearchProvider) document.getElementById('search-provider').value = r.cwaSearchProvider;
+  if (r.cwaSearchApiKey)   document.getElementById('search-api-key').value  = r.cwaSearchApiKey;
+});
+
+document.getElementById('toggle-search-key').addEventListener('click', function() {
+  var inp  = document.getElementById('search-api-key');
+  var show = inp.type === 'password';
+  inp.type = show ? 'text' : 'password';
+  this.textContent = show ? 'HIDE' : 'SHOW';
+});
+
+document.getElementById('save-search').addEventListener('click', function() {
+  var provider = document.getElementById('search-provider').value;
+  var key      = document.getElementById('search-api-key').value.trim();
+  chrome.storage.sync.set({ cwaSearchProvider: provider, cwaSearchApiKey: key }, function() {
+    var st = document.getElementById('search-status');
+    st.textContent = 'SAVED';
+    setTimeout(function() { st.textContent = ''; }, 2000);
+  });
+});

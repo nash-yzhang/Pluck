@@ -236,6 +236,33 @@
     .msg.assistant em    { font-style: italic; opacity: .85; }
     .msg.assistant a     { color: var(--ai-border); text-decoration: none; }
     .msg.assistant a:hover { text-decoration: underline; }
+    /* [SEARCH: ...] links suggested by the LLM */
+    .msg.assistant a.search-link {
+      display: inline-flex; align-items: center;
+      background: var(--accent-bg); border: 1px solid var(--accent);
+      border-radius: 3px; padding: 1px 7px; margin: 1px 0;
+      color: var(--accent); text-decoration: none;
+      font-size: 10px; letter-spacing: 0.3px; cursor: pointer;
+    }
+    .msg.assistant a.search-link:hover { background: var(--accent); color: var(--bg); text-decoration: none; }
+
+    /* Web search result message */
+    .search-result-header {
+      font-size: 10px; color: var(--ai-border); letter-spacing: 0.5px;
+      margin-bottom: 5px; padding-bottom: 4px; border-bottom: 1px solid var(--border);
+    }
+    .search-cite {
+      font-size: 8px; color: var(--accent); cursor: pointer;
+      border: 1px solid var(--accent); border-radius: 2px;
+      padding: 0 2px; margin-left: 1px; vertical-align: super;
+      line-height: 1; transition: background .12s, color .12s; user-select: none;
+    }
+    .search-cite:hover { background: var(--accent); color: var(--bg); }
+    .search-src-link {
+      color: var(--ai-border); text-decoration: none; font-size: 10px;
+      word-break: break-all; flex: 1;
+    }
+    .search-src-link:hover { text-decoration: underline; }
     .msg.assistant blockquote {
       border-left: 2px solid var(--border2); margin: 3px 0; padding: 2px 8px; opacity: .7; }
 
@@ -261,6 +288,7 @@
       background: none; border: 1px solid var(--border2); border-radius: 2px;
       color: var(--fg3); font-family: inherit; font-size: 14px;
       padding: 2px 8px; cursor: pointer; flex-shrink: 0; transition: all .15s;
+      min-height: 26px; box-sizing: border-box; align-self: flex-end; line-height: 1;
     }
     #chat-send:hover  { color: var(--accent); border-color: var(--accent); }
     #chat-send:disabled { opacity: .3; cursor: default; }

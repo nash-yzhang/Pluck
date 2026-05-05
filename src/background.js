@@ -26,17 +26,23 @@ async function getConfig() {
   });
 }
 
-function buildMessages(payload) {
-  let system =
+function buildMessages(payload, provider) {
+  let baseSystem =
     'You are a browser-embedded web assistant. Be CONCISE and FAST.\n' +
     '- Lead with the answer, add detail only if essential.\n' +
     '- Use the page URL and title to infer context instantly.\n' +
     '- [Key] marks text the user highlighted — treat it as the primary focus.\n' +
     '- [Context] is the surrounding element/page content for reference.\n' +
-    '- Answer in the same language the user writes in.';
+    '- Answer in the same language the user writes in.\n' +
+    '- When a web search would meaningfully help, include [SEARCH: specific query] anywhere in your reply.';
 
   if (payload.presetInstruction) {
-    system += '\n\nUser-selected instruction (apply to this response): ' + payload.presetInstruction;
+    baseSystem += '\n\nUser-selected instruction (apply to this response): ' + payload.presetInstruction;
+  }
+
+  // Phase 0-C: prepend resume summary when available
+  if (payload.resumeSummary) {
+    baseSystem = '[Previous session summary]:\n' + payload.resumeSummary + '\n\n' + baseSystem;
   }
 
   const msgs = [];
@@ -44,7 +50,7 @@ function buildMessages(payload) {
   // Conversation history (raw Q&A pairs)
   (payload.messages || []).forEach(m => msgs.push(m));
 
-  // Build current user message with fresh page context
+  // Build current user message — page context lives in system, not here
   const parts = [];
   parts.push(`[Page: ${payload.url}]`);
   if (payload.meta && payload.meta.title)       parts.push(`[Title: ${payload.meta.title}]`);
@@ -63,6 +69,33 @@ function buildMessages(payload) {
   parts.push(`\nQuestion: ${payload.prompt}`);
   msgs.push({ role: 'user', content: parts.join('\n') });
 
+  // Phase 0-B: build effective page context (base + delta)
+  let effectivePageContext = payload.pageContext || null;
+  if (effectivePageContext && payload.pageDelta) {
+    effectivePageContext += '\n\n[Page Update]:\n' + payload.pageDelta;
+  } else if (!effectivePageContext && payload.pageDelta) {
+    effectivePageContext = payload.pageDelta;
+  }
+
+  // For Claude: explicit prompt caching — system as array of blocks with cache_control.
+  if (provider === 'claude') {
+    const blocks = [
+      { type: 'text', text: baseSystem, cache_control: { type: 'ephemeral' } },
+    ];
+    if (effectivePageContext) {
+      blocks.push({
+        type: 'text',
+        text: '[Full Page Content]:\n' + effectivePageContext,
+        cache_control: { type: 'ephemeral' },
+      });
+    }
+    return { system: blocks, messages: msgs };
+  }
+
+  // Other providers: flat string system
+  const system = effectivePageContext
+    ? baseSystem + '\n\n[Full Page Content]:\n' + effectivePageContext
+    : baseSystem;
   return { system, messages: msgs };
 }
 
@@ -133,14 +166,18 @@ async function streamOpenAICompatible(provider, apiKey, model, messages, onChunk
 
 async function streamAnthropic(apiKey, model, system, messages, onChunk) {
   const cfg = cwaGetProviderConfig('claude');
+  const claudeHeaders = {
+    'Content-Type': 'application/json',
+    'x-api-key': apiKey,
+    'anthropic-version': '2023-06-01',
+    'anthropic-dangerous-direct-browser-access': 'true',
+  };
+  // Enable prompt caching when system is an array of blocks with cache_control
+  if (Array.isArray(system)) claudeHeaders['anthropic-beta'] = 'prompt-caching-2024-07-31';
+
   const response = await fetch(cfg.endpoint, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-api-key': apiKey,
-      'anthropic-version': '2023-06-01',
-      'anthropic-dangerous-direct-browser-access': 'true',
-    },
+    headers: claudeHeaders,
     body: JSON.stringify({
       model,
       system,
@@ -195,7 +232,11 @@ async function streamProviderResponse(provider, apiKey, model, messageData, onCh
     return streamAnthropic(apiKey, model, messageData.system, messageData.messages, onChunk);
   }
 
-  return streamOpenAICompatible(provider, apiKey, model, [{ role: 'system', content: messageData.system }].concat(messageData.messages), onChunk);
+  // Flatten array system (Claude format) to string for OpenAI-compatible providers
+  const sysContent = Array.isArray(messageData.system)
+    ? messageData.system.map(b => b.text).join('\n\n')
+    : messageData.system;
+  return streamOpenAICompatible(provider, apiKey, model, [{ role: 'system', content: sysContent }].concat(messageData.messages), onChunk);
 }
 
 async function requestOpenAICompatibleJson(provider, apiKey, body) {
@@ -240,7 +281,7 @@ chrome.runtime.onConnect.addListener(contentPort => {
       return;
     }
 
-    const messageData = buildMessages(msg.payload);
+    const messageData = buildMessages(msg.payload, provider);
     const modelName = msg.payload.model || model;
     LOG('QUERY provider=', provider, 'model=', modelName, 'msgs=', messageData.messages.length + 1);
 
@@ -270,6 +311,39 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
     getConfig().then(cfg => {
       respond({ ok: true, hasKey: !!cfg.apiKey, provider: cfg.provider, model: cfg.model });
     });
+    return true;
+  }
+  // Phase 0-C: generate a short resume summary for a conversation with ≥4 messages
+  if (msg.type === 'RESUME_SUMMARIZE') {
+    (async () => {
+      const { apiKey, model, provider } = await getConfig();
+      if (!apiKey) { respond({ error: 'No API key set.' }); return; }
+      const { messages } = msg.payload;
+      const prompt = 'Summarize this conversation in ≤5 bullet points for context resumption. Be very concise.';
+      const summaryMsgs = (messages || []).concat([{ role: 'user', content: prompt }]);
+      try {
+        let summary = '';
+        if (provider === 'claude') {
+          const data = await requestAnthropicJson(apiKey, {
+            model, max_tokens: 300,
+            system: 'Return a short bullet-point summary (≤5 bullets, ≤150 tokens).',
+            messages: summaryMsgs,
+          });
+          summary = ((data.content || []).map(p => p.text || '').join('')).trim();
+        } else {
+          const data = await requestOpenAICompatibleJson(provider, apiKey, {
+            model,
+            messages: [{ role: 'system', content: 'Return a short bullet-point summary (≤5 bullets, ≤150 tokens).' }].concat(summaryMsgs),
+            stream: false, max_completion_tokens: 300,
+          });
+          summary = (data.choices[0].message.content || '').trim();
+        }
+        respond({ summary });
+      } catch(e) {
+        ERR('RESUME_SUMMARIZE error:', e.message);
+        respond({ error: e.message });
+      }
+    })();
     return true;
   }
   if (msg.type === 'HISTORY_SAVE') {
@@ -410,6 +484,140 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
     })();
     return true;
   }
+
+  // ── AI-powered on-page find (Alt+F panel fallback) ─────────────────────
+  if (msg.type === 'FIND_ON_PAGE') {
+    const tabId = sender.tab && sender.tab.id;
+    const { query, pageText, mode, searchId } = msg.payload;
+    respond({ started: true }); // release the sendMessage callback immediately
+    // mode: 1=strict(scores 3-4), 2=related(2-4), 3=general(1-4), 4=broad(1-4)
+    const modeInstructions = [
+      '',
+      'Return ONLY verbatim text with score 3 or 4. Only exact or very close matches to the query meaning.',
+      'Return verbatim text semantically related to the query. Score 2-4.',
+      'Return verbatim text generally related to the query topic. Score 1-4.',
+      'Return anything on the page that could be broadly related. Score 1-4.',
+    ];
+    const safeMode = Math.max(1, Math.min(4, mode || 2));
+    const prompt =
+      'Find passages in the page text matching the user query.\n' +
+      modeInstructions[safeMode] + '\n\n' +
+      'Output one JSON object per line (NDJSON). No other text, no markdown:\n' +
+      '{"text":"verbatim substring from page (10-120 chars)","score":4}\n' +
+      'Scores: 4=exact match, 3=closely related, 2=generally related, 1=broad/tangential.\n' +
+      'Max 12 results. Each "text" must be a verbatim substring of the page text.\n\n' +
+      'User query: ' + query + '\n\nPage text:\n' + pageText;
+    (async () => {
+      const { apiKey, model, provider } = await getConfig();
+      if (!apiKey) {
+        if (tabId) chrome.tabs.sendMessage(tabId, { type: 'FIND_DONE', searchId }).catch(() => {});
+        return;
+      }
+      const sendChunk = (text, score) => {
+        if (tabId) chrome.tabs.sendMessage(tabId, { type: 'FIND_CHUNK', text, score, searchId }).catch(() => {});
+      };
+      let buffer = '';
+      try {
+        await streamProviderResponse(provider, apiKey, model, {
+          system: 'Output NDJSON only. Each line: {"text":"verbatim quote","score":N}. No markdown, no extra text.',
+          messages: [{ role: 'user', content: prompt }],
+        }, delta => {
+          buffer += delta;
+          let nl;
+          while ((nl = buffer.indexOf('\n')) !== -1) {
+            const line = buffer.slice(0, nl).trim();
+            buffer = buffer.slice(nl + 1);
+            if (!line) continue;
+            try {
+              const obj = JSON.parse(line);
+              if (obj && typeof obj.text === 'string' && typeof obj.score === 'number') {
+                sendChunk(obj.text, obj.score);
+              }
+            } catch(_) {}
+          }
+        });
+        // flush remaining buffer
+        const rem = buffer.trim();
+        if (rem) { try { const obj = JSON.parse(rem); if (obj && typeof obj.text === 'string') sendChunk(obj.text, obj.score || 2); } catch(_) {} }
+      } catch(e) {
+        ERR('FIND_ON_PAGE stream error:', e.message);
+      }
+      if (tabId) chrome.tabs.sendMessage(tabId, { type: 'FIND_DONE', searchId }).catch(() => {});
+    })();
+    return false; // respond() already called synchronously
+  }
+
+  // ── Web search with LLM-cited summary ──────────────────────────────────
+  if (msg.type === 'WEB_SEARCH') {
+    (async () => {
+      const { apiKey, model, provider } = await getConfig();
+      if (!apiKey) { respond({ error: 'No LLM API key set.' }); return; }
+      const { query } = msg.payload;
+      const searchCfg = await new Promise(r => chrome.storage.sync.get(['cwaSearchApiKey', 'cwaSearchProvider'], r));
+      const searchKey      = (searchCfg.cwaSearchApiKey || '').trim();
+      const searchProvider = searchCfg.cwaSearchProvider || 'brave';
+      if (!searchKey) { respond({ error: 'No Search API key configured. Add one in Settings → Search API.' }); return; }
+      try {
+        let results = [];
+        if (searchProvider === 'brave') {
+          const r = await fetch(
+            'https://api.search.brave.com/res/v1/web/search?q=' + encodeURIComponent(query) + '&count=6&text_decorations=0',
+            { headers: { 'Accept': 'application/json', 'Accept-Encoding': 'gzip', 'X-Subscription-Token': searchKey } }
+          );
+          if (!r.ok) throw new Error('Brave Search error ' + r.status + ': ' + await r.text().then(t => t.slice(0,200)));
+          const data = await r.json();
+          results = ((data.web && data.web.results) || []).slice(0, 6).map(item => ({
+            title: item.title || '', url: item.url || '', snippet: item.description || '',
+          }));
+        } else if (searchProvider === 'serper') {
+          const r = await fetch('https://google.serper.dev/search', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-API-KEY': searchKey },
+            body: JSON.stringify({ q: query, num: 6 }),
+          });
+          if (!r.ok) throw new Error('Serper error ' + r.status);
+          const data = await r.json();
+          results = (data.organic || []).slice(0, 6).map(item => ({
+            title: item.title || '', url: item.link || '', snippet: item.snippet || '',
+          }));
+        }
+        if (!results.length) { respond({ error: 'No search results returned.' }); return; }
+
+        const srcBlock = results.map((r, i) =>
+          '[' + (i+1) + '] ' + r.title + '\n' + r.url + '\n' + r.snippet
+        ).join('\n\n');
+        const summaryPrompt =
+          'Summarize these web search results to answer: "' + query + '"\n' +
+          'Rules:\n' +
+          '- Every factual statement MUST be followed by a citation like [1] or [2] immediately after.\n' +
+          '- Write 3–6 bullet points. Be concise and factual.\n' +
+          '- Answer in the same language as the query.\n' +
+          '- Use only the source numbers from the list below.\n\n' +
+          'Sources:\n' + srcBlock;
+        let summary = '';
+        if (provider === 'claude') {
+          const data = await requestAnthropicJson(apiKey, {
+            model, max_tokens: 1024,
+            system: 'You summarize web search results with inline numbered citations [N]. Be concise.',
+            messages: [{ role: 'user', content: summaryPrompt }],
+          });
+          summary = ((data.content || []).map(p => p.text || '').join('')).trim();
+        } else {
+          const data = await requestOpenAICompatibleJson(provider, apiKey, {
+            model, messages: [{ role: 'user', content: summaryPrompt }],
+            stream: false, max_completion_tokens: 1024,
+          });
+          summary = (data.choices[0].message.content || '').trim();
+        }
+        respond({ summary, sources: results, query });
+      } catch(e) {
+        ERR('WEB_SEARCH error:', e.message);
+        respond({ error: e.message });
+      }
+    })();
+    return true;
+  }
+
   return false;
 });
 
@@ -432,6 +640,11 @@ chrome.commands.onCommand.addListener((command, tab) => {
         }, 300);
       })
       .catch(e => ERR('sidePanel.open', e));
+  }
+
+  if (command === 'find-on-page') {
+    chrome.tabs.sendMessage(tab.id, { type: 'TOGGLE_FIND_PANEL' }).catch(e => ERR('find-on-page sendMessage', e));
+    return;
   }
 
   if (command === 'toggle-sidebar') {
