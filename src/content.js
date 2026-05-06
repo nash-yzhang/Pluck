@@ -22,6 +22,8 @@
 
   // Phase 0-A: Per-URL page text cache for FIND_ON_PAGE (avoids re-capture on repeat queries)
   const _pageTextCache = {};
+  // Phase 1: DOM chunk cache — {idx, text, el}[] per URL; text for retrieval, el for highlighting
+  const _pageChunkCache = {};
   // Phase 0-B: MutationObserver for SPA delta detection
   let _pageObserver = null;
   window.__cwa_delta__ = null;
@@ -320,8 +322,51 @@
     if (msg.type === 'TOGGLE_FIND_PANEL') {
       if (_find.visible) { hideFindPanel(); } else { showFindPanel(); }
     }
-    if (msg.type === 'FIND_CHUNK') { _applyFindChunk(msg.text, msg.score, msg.searchId); }
+    if (msg.type === 'FIND_CHUNK') { _applyFindChunk(msg.chunkIdx, msg.score, msg.searchId); }
     if (msg.type === 'FIND_DONE')  { _finalizeFindSearch(msg.searchId); }
+    // AUTO_FIND: sidebar Q&A → BM25-only chunk highlights + sidebar badge navigation (zero LLM cost)
+    // No find panel; scroll saved before first hit and restored on next Q&A / sidebar close / Alt+S.
+    if (msg.type === 'AUTO_FIND') {
+      // Restore previous scroll before starting fresh
+      if (_autoFindSavedScroll !== null) {
+        window.scrollTo({ top: _autoFindSavedScroll, behavior: 'instant' });
+        _autoFindSavedScroll = null;
+      }
+      clearFindHighlights();
+      _autoFindHits = [];
+      _find.searchId++;
+      _autoFindSearchId = _find.searchId;
+      _find.suppressAutoNav = true;  // scroll managed manually per-hit below
+      _doFindAI(msg.query, 2, _find.searchId, true);
+    }
+    // Scroll page to a specific AUTO_FIND chunk (sidebar badge click)
+    if (msg.type === 'SCROLL_TO_CHUNK') {
+      const _scChunks = _pageChunkCache[location.href];
+      if (_scChunks && msg.chunkIdx >= 0 && msg.chunkIdx < _scChunks.length) {
+        const _scEl = _scChunks[msg.chunkIdx].el;
+        if (_scEl && _scEl.isConnected) {
+          _scEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          // Temporary pulse highlight: visible for 2s then restored
+          const _prevOutline = _scEl.style.outline;
+          const _prevBg = _scEl.style.background;
+          _scEl.style.outline = '2px solid #4dfa9a';
+          _scEl.style.background = 'rgba(77,250,154,0.12)';
+          setTimeout(function() {
+            _scEl.style.outline = _prevOutline;
+            _scEl.style.background = _prevBg;
+          }, 2000);
+        }
+      }
+    }
+    // Restore scroll and clear highlights (triggered by: next Q&A, sidebar close, Alt+S)
+    if (msg.type === 'RESTORE_SCROLL') {
+      if (_autoFindSavedScroll !== null) {
+        window.scrollTo({ top: _autoFindSavedScroll, behavior: 'smooth' });
+        _autoFindSavedScroll = null;
+      }
+      clearFindHighlights();
+      _autoFindHits = [];
+    }
     if (msg.type === 'TOGGLE_VISUAL_MODE') {
       if (SEL.state === 'picking') { SEL.reset(); }
       else { SEL.startPicking(); }
@@ -391,6 +436,7 @@
     visible: false, panel: null, inp: null, counter: null,
     slider: null, statusEl: null, modeLabel: null, _debounce: null,
     searchId: 0, pos: null, lastQuery: '', minScore: 1,
+    suppressAutoNav: false,  // true for AUTO_FIND from sidebar (no jarring scroll)
   };
 
   // Re-clamp find panel when Chrome side-panel open/close shrinks the viewport
@@ -406,6 +452,11 @@
   });
   let _findHighlights = [];
   let _findActive = -1;
+
+  // AUTO_FIND state — hits collected per sidebar Q&A, scroll position saved before first navigation
+  let _autoFindHits = [];
+  let _autoFindSearchId = -1;
+  let _autoFindSavedScroll = null;
 
   function _navBtnCss() {
     return 'background:#1f1f23;border:1px solid #2a2a38;border-radius:3px;' +
@@ -556,6 +607,13 @@
   }
 
   function showFindPanel() {
+    // Restore AUTO_FIND scroll when user explicitly opens Alt+S find panel
+    if (_autoFindSavedScroll !== null) {
+      window.scrollTo({ top: _autoFindSavedScroll, behavior: 'instant' });
+      _autoFindSavedScroll = null;
+      clearFindHighlights();
+      _autoFindHits = [];
+    }
     createFindPanel();
     if (!document.body.contains(_find.panel)) document.body.appendChild(_find.panel);
     _find.panel.style.display = 'flex';
@@ -637,27 +695,68 @@
     });
   }
 
-  function _doFindAI(query, mode, searchId) {
+  // Phase 1: HTML denoising — skip elements inside structural noise zones (nav/header/footer/ads)
+  // Note: _doFindAI signature extended with optional bm25Only param (used by AUTO_FIND)
+  const _NOISY_TAGS = new Set(['nav', 'header', 'footer', 'aside']);
+  const _NOISY_ROLES = new Set(['navigation', 'banner', 'contentinfo', 'complementary', 'menubar', 'menu']);
+  const _NOISY_CLS_RE = /\b(nav|menu|sidebar|side-bar|footer|header|cookie|consent|ad-|ads-|banner|popup|modal|toast|overlay)\b/i;
+  function _isNoisyAncestor(el) {
+    let cur = el.parentElement;
+    while (cur && cur !== document.body) {
+      const tag = (cur.tagName || '').toLowerCase();
+      if (_NOISY_TAGS.has(tag)) return true;
+      const role = cur.getAttribute('role') || '';
+      if (_NOISY_ROLES.has(role)) return true;
+      const cls = (cur.className && typeof cur.className === 'string') ? cur.className : '';
+      const id = cur.id || '';
+      if (_NOISY_CLS_RE.test(cls) || _NOISY_CLS_RE.test(id)) return true;
+      cur = cur.parentElement;
+    }
+    return false;
+  }
+
+  // Phase 1: Build DOM chunk array — text for BM25/LLM retrieval, el for direct DOM highlighting
+  function _chunkPage(url) {
+    if (_pageChunkCache[url]) return _pageChunkCache[url];
+    const els = document.querySelectorAll('p,h1,h2,h3,h4,h5,h6,li,blockquote,td,th,figcaption,caption');
+    const chunks = [];
+    for (let i = 0; i < els.length; i++) {
+      const el = els[i];
+      let inPanel = false, anc = el;
+      while (anc) { if (anc.id === '__cwa_find_panel__') { inPanel = true; break; } anc = anc.parentElement; }
+      if (inPanel) continue;
+      if (_isNoisyAncestor(el)) continue;
+      const text = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+      if (text.length < 20) continue;
+      chunks.push({ idx: chunks.length, text: text.slice(0, 500), el });
+    }
+    _pageChunkCache[url] = chunks;
+    return chunks;
+  }
+
+  function _doFindAI(query, mode, searchId, bm25Only) {
     if (_find.statusEl) _find.statusEl.textContent = '\u23f3\u00a0AI searching\u2026';
     if (!_findHighlights.length && _find.counter) _find.counter.textContent = 'AI\u2026';
 
-    // Phase 0-A: reuse cached page text; capture once per URL
     const url = location.href;
-    let pageText;
-    if (_pageTextCache[url]) {
-      pageText = _pageTextCache[url];
-    } else {
-      pageText = ((document.body && document.body.innerText) || '').replace(/\n{3,}/g, '\n\n').trim().slice(0, 25000);
-      _pageTextCache[url] = pageText;
-      _attachPageObserver(url, pageText);  // Phase 0-B: watch for SPA mutations
+    // Phase 0-B / Phase 1: on SPA delta invalidate both caches so new content is chunked fresh
+    if (window.__cwa_delta__) {
+      delete _pageChunkCache[url];
+      delete _pageTextCache[url];
+      window.__cwa_delta__ = null;
     }
 
-    // Phase 0-B: consume accumulated delta and clear it
-    const pageDelta = window.__cwa_delta__ || undefined;
-    window.__cwa_delta__ = null;
+    // Phase 1: build denoised DOM chunks (text for retrieval, el for highlighting)
+    const chunks = _chunkPage(url);
+    // Keep text cache alive for SPA observer snapshot
+    if (!_pageTextCache[url]) {
+      const joined = chunks.map(function(c) { return c.text; }).join('\n');
+      _pageTextCache[url] = joined;
+      _attachPageObserver(url, joined);
+    }
 
     chrome.runtime.sendMessage(
-      { type: 'FIND_ON_PAGE', payload: { query, pageText, pageDelta, mode, searchId } },
+      { type: 'FIND_ON_PAGE', payload: { query, chunks: chunks.map(function(c) { return { idx: c.idx, text: c.text }; }), mode, searchId, bm25Only: !!bm25Only } },
       function(resp) { if (chrome.runtime.lastError) ERR('FIND_ON_PAGE send:', chrome.runtime.lastError.message); }
     );
   }
@@ -720,27 +819,49 @@
     return true;
   }
 
-  function _applyFindChunk(text, score, searchId) {
+  // Phase 1: highlight by chunk element reference — no string-match reversal needed
+  function _applyFindChunk(chunkIdx, score, searchId) {
     if (_find.searchId !== searchId) return;
-    const color = _FC[Math.max(1, Math.min(4, score || 2))];
-    // Normalize whitespace — LLM quotes often collapse newlines between DOM elements
-    const normNeedle = (text || '').replace(/\s+/g, ' ').trim().toLowerCase().slice(0, 120);
-    if (normNeedle.length < 3) return;
+    const url = location.href;
+    const chunks = _pageChunkCache[url];
+    if (!chunks || chunkIdx < 0 || chunkIdx >= chunks.length) return;
+    const chunk = chunks[chunkIdx];
+    const el = chunk.el;
+    if (!el || !el.isConnected) return;
 
-    // Try text-node split first (precise; preserves highlight colour in text)
-    if (!_tryTextNodeHL(normNeedle, score, color)) {
-      // Fallback: element outline (for SPAs with fragmented/virtualized DOM)
-      _tryElemHL(normNeedle, score, color);
+    if (searchId === _autoFindSearchId) {
+      // AUTO_FIND: silently collect hit for sidebar PAGE SECTIONS panel.
+      // NO page highlight during collection — only a temporary flash when user clicks to navigate.
+      // Use longer snippet (120 chars) for meaningful PAGE SECTIONS quotes.
+      const _afSnippet = chunk.text.slice(0, 120);
+      _autoFindHits.push({ chunkIdx, score, snippet: _afSnippet });
+      // Save scroll position on first hit (needed for RESTORE_SCROLL)
+      if (_autoFindHits.length === 1) _autoFindSavedScroll = window.scrollY;
+    } else {
+      // Regular FIND_ON_PAGE: apply persistent visual highlight
+      const color = _FC[Math.max(1, Math.min(4, score || 2))];
+      const origOutline = el.style.outline;
+      const origBg = el.style.background;
+      el.style.outline = '2px solid ' + color.bg;
+      el.style.background = color.bg + '26';
+      _findHighlights.push({ type: 'elem', el, origOutline, origBg, color, score });
+      updateFindCounter();
+      if (!_find.suppressAutoNav && _findActive < 0 && _findHighlights.length) {
+        navigateFindMatchAbsolute(0);
+      }
     }
-    updateFindCounter();
-    if (_findActive < 0 && _findHighlights.length) navigateFindMatchAbsolute(0);
   }
 
   function _finalizeFindSearch(searchId) {
     if (_find.searchId !== searchId) return;
+    _find.suppressAutoNav = false;
     if (_find.statusEl) _find.statusEl.textContent = '';
     if (!_findHighlights.length && _find.counter) _find.counter.textContent = 'not found';
     else updateFindCounter();
+    // Report hits to background → sidepanel for badge navigation
+    if (searchId === _autoFindSearchId && _autoFindHits.length) {
+      chrome.runtime.sendMessage({ type: 'AUTO_FIND_HITS', hits: _autoFindHits }).catch(() => {});
+    }
   }
 
   // Collect the full ancestor element set of a node (up to body).
@@ -1326,6 +1447,7 @@
           }
         }
         lastSnapshot = newText.slice(0, 25000);
+        delete _pageChunkCache[url]; // Phase 1: invalidate chunk cache on SPA content change
       }, 500);
     });
     _pageObserver.observe(root, { childList: true, subtree: true });

@@ -355,6 +355,24 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
     });
     return true;
   }
+  // AUTO_FIND hits relay: content.js → background → chrome.storage.session → sidepanel.js
+  if (msg.type === 'AUTO_FIND_HITS') {
+    chrome.storage.session.set({ cwaAutoFindHits: msg.hits });
+    respond({});
+    return false;
+  }
+  // SCROLL_TO_CHUNK_RELAY: sidepanel → background → active tab content script
+  // Avoids unreliable direct sidepanel→tab messaging when sidepanel has focus.
+  if (msg.type === 'SCROLL_TO_CHUNK_RELAY') {
+    (async () => {
+      const tabs = await chrome.tabs.query({ active: true, currentWindow: true }).catch(() => []);
+      if (tabs && tabs[0] && tabs[0].id) {
+        chrome.tabs.sendMessage(tabs[0].id, { type: 'SCROLL_TO_CHUNK', chunkIdx: msg.chunkIdx }).catch(() => {});
+      }
+      respond({});
+    })();
+    return true;
+  }
   // Phase 0-C: generate a short resume summary for a conversation with ≥4 messages
   if (msg.type === 'RESUME_SUMMARIZE') {
     (async () => {
@@ -485,7 +503,7 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
       if (!apiKey) { respond({ error: 'No API key set.' }); return; }
       const { reply, sources, model: reqModel, priorAttributions } = msg.payload;
       const srcBlock = sources.map((s, i) =>
-        `[${i}] ${s.title ? s.title + ' @ ' : ''}${s.url || 'source'}:\n${s.text.slice(0, 6000)}`
+        `[${i}] ${s.title ? s.title + ' @ ' : ''}${s.url || 'source'}:\n${s.text.slice(0, 8000)}`
       ).join('\n\n');
       let prompt =
         'You are a citation attribution assistant. The AI reply and the source texts may be in DIFFERENT languages (e.g. reply in Chinese, sources in English). This is normal — the reply was generated from those sources via translation or paraphrase.\n\n' +
@@ -538,41 +556,165 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
     return true;
   }
 
-  // ── AI-powered on-page find (Alt+F panel fallback) ─────────────────────
+  // ── BM25-lite pre-filter: char-budget selection with low-confidence structural fallback ─
+  // Returns { idxs: number[], lowConf: boolean }
+  // - Greedily fills charBudget by BM25 rank (no fixed topK cap).
+  // - lowConf=true when max BM25 score < 0.5 (vocabulary mismatch: query terms absent from page).
+  // - On lowConf, adds evenly-spaced structural coverage to fill remaining budget so large pages
+  //   are sampled across all sections rather than only the (wrong) BM25 top.
+  // Tokenize text for BM25: Latin words + CJK bigrams (handles Chinese/Japanese/Korean).
+  function _tokenize(text) {
+    const lower = text.toLowerCase();
+    const tokens = lower.match(/\w+/g) || [];
+    // CJK unified ideographs: U+4E00–U+9FFF and common extension ranges
+    const cjkRe = /[\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff\u3040-\u30ff\uac00-\ud7af]/g;
+    let m;
+    while ((m = cjkRe.exec(lower)) !== null) {
+      // emit each character as a unigram AND a bigram with the next character
+      tokens.push(m[0]);
+      const next = lower[m.index + 1];
+      if (next && /[\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff\u3040-\u30ff\uac00-\ud7af]/.test(next)) {
+        tokens.push(m[0] + next);
+      }
+    }
+    return tokens;
+  }
+
+  function _bm25Select(chunks, query, charBudget) {
+    const N = chunks.length;
+    if (!N) return { idxs: [], lowConf: false };
+    const qTokens = _tokenize(query);
+    // No query tokens: evenly sample to fill budget
+    if (!qTokens.length) {
+      const idxs = [];
+      let chars = 0;
+      const step = Math.max(1, Math.floor(N / 30));
+      for (let i = 0; i < N && chars < charBudget; i += step) {
+        idxs.push(chunks[i].idx);
+        chars += chunks[i].text.length;
+      }
+      return { idxs, lowConf: true };
+    }
+    const df = {};
+    chunks.forEach(function(c) {
+      const seen = new Set(_tokenize(c.text));
+      seen.forEach(function(t) { df[t] = (df[t] || 0) + 1; });
+    });
+    const avgLen = chunks.reduce(function(s, c) { return s + c.text.length; }, 0) / N;
+    const k1 = 1.5, b = 0.75;
+    const scores = chunks.map(function(c) {
+      const tokens = _tokenize(c.text);
+      const tf = {};
+      tokens.forEach(function(t) { tf[t] = (tf[t] || 0) + 1; });
+      const docLen = tokens.length;
+      let score = 0;
+      qTokens.forEach(function(qt) {
+        const f = tf[qt] || 0;
+        if (!f) return;
+        const idf = Math.log((N - (df[qt] || 0) + 0.5) / ((df[qt] || 0) + 0.5) + 1);
+        score += idf * (f * (k1 + 1)) / (f + k1 * (1 - b + b * docLen / avgLen));
+      });
+      return { idx: c.idx, score };
+    });
+    scores.sort(function(a, bv) { return bv.score - a.score; });
+    const maxScore = scores[0].score;
+    const lowConf = maxScore < 0.5;
+    // Fill budget greedily by BM25 rank
+    const selected = new Set();
+    let chars = 0;
+    for (let i = 0; i < scores.length && chars < charBudget; i++) {
+      if (scores[i].score <= 0) break;
+      const ci = scores[i].idx;
+      selected.add(ci);
+      chars += chunks[ci] ? chunks[ci].text.length : 0;
+    }
+    // Low-confidence: vocabulary mismatch — supplement with evenly-spaced structural coverage
+    // to sample all sections of the page rather than concentrating on the wrong area.
+    if (lowConf && chars < charBudget * 0.7) {
+      const step = Math.max(1, Math.floor(N / 25));
+      for (let i = 0; i < N && chars < charBudget; i += step) {
+        const ci = chunks[i].idx;
+        if (!selected.has(ci)) {
+          selected.add(ci);
+          chars += chunks[ci] ? chunks[ci].text.length : 0;
+        }
+      }
+    }
+    return { idxs: Array.from(selected), lowConf };
+  }
+
+  // ── AI-powered on-page find (Alt+S panel fallback) ─────────────────────
   if (msg.type === 'FIND_ON_PAGE') {
     const tabId = sender.tab && sender.tab.id;
-    const { query, pageText, mode, searchId } = msg.payload;
+    const { query, chunks, mode, searchId, bm25Only } = msg.payload;
     respond({ started: true }); // release the sendMessage callback immediately
-    // mode: 1=strict(scores 3-4), 2=related(2-4), 3=general(1-4), 4=broad(1-4)
-    const modeInstructions = [
-      '',
-      'Return ONLY verbatim text with score 3 or 4. Only exact or very close matches to the query meaning.',
-      'Return verbatim text semantically related to the query. Score 2-4.',
-      'Return verbatim text generally related to the query topic. Score 1-4.',
-      'Return anything on the page that could be broadly related. Score 1-4.',
-    ];
-    const safeMode = Math.max(1, Math.min(4, mode || 2));
-    const prompt =
-      'Find passages in the page text matching the user query.\n' +
-      modeInstructions[safeMode] + '\n\n' +
-      'Output one JSON object per line (NDJSON). No other text, no markdown:\n' +
-      '{"text":"verbatim substring from page (10-120 chars)","score":4}\n' +
-      'Scores: 4=exact match, 3=closely related, 2=generally related, 1=broad/tangential.\n' +
-      'Max 12 results. Each "text" must be a verbatim substring of the page text.\n\n' +
-      'User query: ' + query + '\n\nPage text:\n' + pageText;
     (async () => {
+      const sendChunk = (chunkIdx, score) => {
+        if (tabId) chrome.tabs.sendMessage(tabId, { type: 'FIND_CHUNK', chunkIdx, score, searchId }).catch(() => {});
+      };
+      // lowConf = vocabulary/language mismatch: use larger budget so LLM sees more candidates.
+      // highConf = BM25 found keyword matches: tighter budget, stitch ±1 for boundary safety.
+      const { idxs: rawIdxs, lowConf: isLowConf } = (function() {
+        const r1 = _bm25Select(chunks, query, 7000);
+        if (r1.lowConf) return r1;
+        // high-confidence: re-run with tighter budget for token savings
+        const r2 = _bm25Select(chunks, query, 3500);
+        return { idxs: r2.idxs, lowConf: false };
+      }());
+      const stitchedSet = new Set(rawIdxs);
+      if (!isLowConf) {
+        rawIdxs.forEach(function(i) {
+          if (i > 0) stitchedSet.add(i - 1);
+          if (i < chunks.length - 1) stitchedSet.add(i + 1);
+        });
+      }
+      // lowConf: cap at 60 chunks (wide sweep); highConf: cap at 40
+      const hardCap = isLowConf ? 60 : 40;
+      const selected = Array.from(stitchedSet).sort(function(a, b) { return a - b; }).slice(0, hardCap);
+
+      // bm25Only: sidebar AUTO_FIND path — skip LLM entirely, highlight BM25 top results directly
+      if (bm25Only) {
+        rawIdxs.slice(0, 12).forEach(function(i) { sendChunk(i, 2); });
+        if (tabId) chrome.tabs.sendMessage(tabId, { type: 'FIND_DONE', searchId }).catch(() => {});
+        return;
+      }
+
       const { apiKey, model, provider } = await getConfig();
       if (!apiKey) {
         if (tabId) chrome.tabs.sendMessage(tabId, { type: 'FIND_DONE', searchId }).catch(() => {});
         return;
       }
-      const sendChunk = (text, score) => {
-        if (tabId) chrome.tabs.sendMessage(tabId, { type: 'FIND_CHUNK', text, score, searchId }).catch(() => {});
-      };
+      const snippetBlock = selected.map(function(i) {
+        return '[' + i + '] ' + (chunks[i] ? chunks[i].text : '');
+      }).join('\n');
+      // mode: 1=strict(scores 3-4), 2=related(2-4), 3=general(1-4), 4=broad(1-4)
+      const modeInstructions = [
+        '',
+        'Return only chunks with score 3 or 4. Exact or very close semantic match only.',
+        'Return chunks semantically related to the query. Score 2-4.',
+        'Return chunks generally related to the query topic. Score 1-4.',
+        'Return any chunk broadly related to the query. Score 1-4.',
+      ];
+      const safeMode = Math.max(1, Math.min(4, mode || 2));
+      // lowConf: BM25 found no keyword match — query and page likely differ in vocabulary or language.
+      // Instruct LLM to reason about meaning, not surface words.
+      const semanticNote = isLowConf
+        ? 'IMPORTANT: The query and page content may use different vocabulary or different languages. ' +
+          'Match by MEANING and CONCEPT, not by literal words. Cross-language matching is expected.\n\n'
+        : '';
+      const prompt =
+        semanticNote +
+        'Find numbered text chunks that match the user query.\n' +
+        modeInstructions[safeMode] + '\n\n' +
+        'Output one JSON object per line (NDJSON). No other text:\n' +
+        '{"chunkIdx":N,"score":4}\n' +
+        'Scores: 4=exact/equivalent match, 3=closely related, 2=generally related, 1=broad.\n' +
+        'Max 12 results. chunkIdx must be one of the numbers in the list below.\n\n' +
+        'User query: ' + query + '\n\nChunks:\n' + snippetBlock;
       let buffer = '';
       try {
         await streamProviderResponse(provider, apiKey, model, {
-          system: 'Output NDJSON only. Each line: {"text":"verbatim quote","score":N}. No markdown, no extra text.',
+          system: 'Output NDJSON only. Each line: {"chunkIdx":N,"score":M}. No markdown, no extra text.',
           messages: [{ role: 'user', content: prompt }],
         }, delta => {
           buffer += delta;
@@ -583,15 +725,14 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
             if (!line) continue;
             try {
               const obj = JSON.parse(line);
-              if (obj && typeof obj.text === 'string' && typeof obj.score === 'number') {
-                sendChunk(obj.text, obj.score);
+              if (obj && typeof obj.chunkIdx === 'number' && typeof obj.score === 'number') {
+                sendChunk(obj.chunkIdx, obj.score);
               }
             } catch(_) {}
           }
         });
-        // flush remaining buffer
         const rem = buffer.trim();
-        if (rem) { try { const obj = JSON.parse(rem); if (obj && typeof obj.text === 'string') sendChunk(obj.text, obj.score || 2); } catch(_) {} }
+        if (rem) { try { const obj = JSON.parse(rem); if (obj && typeof obj.chunkIdx === 'number') sendChunk(obj.chunkIdx, obj.score || 2); } catch(_) {} }
       } catch(e) {
         ERR('FIND_ON_PAGE stream error:', e.message);
       }
@@ -725,7 +866,9 @@ chrome.commands.onCommand.addListener((command, tab) => {
   }
 
   if (command === 'find-on-page') {
-    chrome.tabs.sendMessage(tab.id, { type: 'TOGGLE_FIND_PANEL' }).catch(e => ERR('find-on-page sendMessage', e));
+    if (tab && tab.id && tab.url && !tab.url.startsWith('chrome://') && !tab.url.startsWith('about:')) {
+      chrome.tabs.sendMessage(tab.id, { type: 'TOGGLE_FIND_PANEL' }).catch(e => ERR('find-on-page sendMessage', e));
+    }
     return;
   }
 

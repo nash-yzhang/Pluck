@@ -393,6 +393,14 @@
       border-radius: 2px; color: var(--fg3); transition: all .15s;
     }
     .trace-btn:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+    #deep-chat-btn {
+      font-family: inherit; font-size: 9px;
+      letter-spacing: 1.5px; padding: 2px 6px; cursor: pointer;
+      background: none; border: 1px solid var(--border2);
+      border-radius: 2px; color: var(--fg3); transition: all .15s; flex-shrink: 0;
+    }
+    #deep-chat-btn:hover { border-color: var(--accent); color: var(--accent); }
+    #deep-chat-btn.active { border-color: var(--accent); color: var(--accent); background: rgba(77,250,154,.12); }
     .trace-btn:disabled { opacity: .4; cursor: default; }
     .trace-empty { font-size: 10px; color: var(--fg3); margin-top: 6px; font-style: italic; }
     /* Inline superscript markers */
@@ -536,6 +544,7 @@
         <span id="g-stxt">READY</span>
       </div>
       <div style="display:flex;gap:6px;align-items:center">
+        <button id="deep-chat-btn" title="Deep Chat — send full page & auto-trace each reply">DEEP</button>
         <button id="model-badge" class="model-badge" title="Click to cycle model">openai/gpt-4o-mini</button>
         <button id="gear-btn" class="gear-btn" title="Settings"></button>
       </div>
@@ -567,6 +576,7 @@
         <textarea id="chat-inp" rows="1" placeholder="ask or continue" spellcheck="false"></textarea>
       </div>
       <button id="chat-send" title="Send (Enter)">&#9654;</button>
+
     </div>
 
     <!-- same status bar, cloned via JS  rendered by insertGlobalSbar() -->

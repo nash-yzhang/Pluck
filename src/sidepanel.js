@@ -53,7 +53,7 @@ const S = {
   ctxNextId:         1,    // global monotone context ID counter
   pageHtmlCache:     {},   // { [url]: { uid, text, title, createdAt } } — session-level page text cache
   resumeCache:       {},   // { [url]: string } — LLM session resume summaries (persisted)
-};
+};  // deep mode is derived from !!S.pageHtmlCache[S.currentUrl] — no separate flag
 
 const $  = id => document.getElementById(id);
 const el = {
@@ -220,6 +220,17 @@ async function init() {
     if (S.chatBusy) { abortCurrentStream(); return; }
     sendChatMessage();
   });
+  document.addEventListener('click', e => {
+    if (e.target.id === 'deep-chat-btn') {
+      if (S.pageHtmlCache[S.currentUrl]) {
+        // Deactivate: evict cache for this URL so full page is no longer sent
+        delete S.pageHtmlCache[S.currentUrl];
+        updateDeepChatBtn();
+      } else {
+        autoCapturePageCtx().catch(() => {});
+      }
+    }
+  });
 
   // Save scroll position per URL so it survives tab switches (e.g. citation clicks)
   el.chatMessages.addEventListener('scroll', () => {
@@ -339,10 +350,9 @@ async function init() {
   // Keep cwaSpOpen in sync so background.js knows the panel is alive
   window.addEventListener('pagehide', () => {
     chrome.storage.session.remove('cwaSpOpen');
-    // Tell the content script to clear the selection highlight when sidebar closes
     chrome.tabs.query({ active: true, currentWindow: true }, tabs => {
       if (tabs[0]) chrome.tabs.sendMessage(tabs[0].id, { type: 'CLEAR_SEL_HL' }).catch(() => {});
-    });
+      });
   });
   LOG('init');
 }
@@ -410,8 +420,6 @@ async function onFloatHandoff(handoff) {
       openChatView(entry);
     }
 
-    autoCapturePageCtx().catch(() => {});
-
     if (handoff.secondQ) {
       HDBG('HANDOFF▶ auto-sending secondQ:', handoff.secondQ.slice(0, 40));
       el.chatInp.value = handoff.secondQ;
@@ -462,7 +470,6 @@ async function onFloatPending(fp) {
     LOG('PENDING▶ saved; calling openChatView; content.length=', entry.content.length);
     openChatView(entry);
     S.suppressHistoryRender = false;
-    autoCapturePageCtx().catch(() => {});
   } catch(e) { ERR('PENDING✗ onFloatPending failed:', e); }
 }
 
@@ -620,6 +627,7 @@ async function autoCapturePageCtx() {
       updateMirror();
     }
     LOG('auto-captured ctx:', id, existingAutoId ? '(reused)' : '(new)', 'chars:', pageText.length);
+    updateDeepChatBtn();
   } catch(e) { ERR('auto-capture failed', e); }
 }
 
@@ -911,12 +919,15 @@ async function onTabNavigated(url, title) {
     if (!S.currentEntry) { backToList(); return; }
     if (S.currentEntry.url !== S.currentUrl) {
       if (entry) { openChatView(entry); } else { backToList(); return; }
-      autoCapturePageCtx().catch(() => {});
+      updateDeepChatBtn();
     }
     return;
   }
   await refreshList(hist);
-  if (entry) { openChatView(entry); autoCapturePageCtx().catch(() => {}); }
+  if (entry) {
+    openChatView(entry);
+    updateDeepChatBtn();
+  }
 }
 
 function onHistoryChanged(newHist) {
@@ -1201,7 +1212,7 @@ async function navigateToCurrent() {
   const hist  = await loadHistory();
   const entry = hist.entries.find(e => e.url === S.currentUrl);
   openChatView(entry || { url: S.currentUrl, title: S.currentTitle, context: [], content: [] });
-  autoCapturePageCtx().catch(() => {});
+  updateDeepChatBtn();
 }
 
 //  Chat view 
@@ -1302,6 +1313,64 @@ function appendMsgEl(role, text, streaming, contextRefs) {
   return div;
 }
 
+// ── AUTO_FIND: PAGE SECTIONS panel (mirrors TRACE SOURCES) ─────────────────
+// BM25 hits are shown as a collapsible panel opened by default.
+// Clicking a row → SCROLL_TO_CHUNK_RELAY → background → content.js → scroll + 2s pulse.
+// Superscript injection is skipped (answer and page often differ in language; no verbatim overlap).
+function _showAutoFindBadges(msgDiv, hits) {
+  if (!msgDiv || !hits || !hits.length) return;
+  // Remove stale panel from prior call on this message
+  msgDiv.querySelectorAll('.auto-find-bar').forEach(function(e) { e.remove(); });
+
+  // Route through background to avoid focus-related failures of direct tab messaging
+  const scrollToChunk = function(chunkIdx) {
+    chrome.runtime.sendMessage({ type: 'SCROLL_TO_CHUNK_RELAY', chunkIdx: chunkIdx }, function() {
+      if (chrome.runtime.lastError) {} // suppress
+    });
+  };
+
+  // Collapsible PAGE SECTIONS panel — reuses trace-footnotes CSS, opened by default
+  const fnWrap = document.createElement('div');
+  fnWrap.className = 'auto-find-bar trace-footnotes';
+
+  const fnToggle = document.createElement('button');
+  fnToggle.className = 'trace-fn-toggle open';
+  fnToggle.textContent = 'PAGE SECTIONS (' + hits.length + ')';
+
+  const fnBody = document.createElement('div');
+  fnBody.className = 'trace-fn-body';
+  // Open by default so user sees clickable rows immediately
+  fnBody.style.display = 'block';
+
+  fnToggle.addEventListener('click', function() {
+    const isOpen = fnBody.style.display !== 'none';
+    fnBody.style.display = isOpen ? 'none' : 'block';
+    fnToggle.classList.toggle('open', !isOpen);
+  });
+
+  hits.forEach(function(hit, i) {
+    const row = document.createElement('div');
+    row.className = 'trace-fn-row';
+    row.style.cursor = 'pointer';
+    row.title = 'Click to scroll to this section on the page';
+    const numEl = document.createElement('span');
+    numEl.className = 'trace-fn-num';
+    numEl.textContent = (i + 1) + '.';
+    const evidEl = document.createElement('span');
+    evidEl.className = 'trace-fn-evid';
+    evidEl.textContent = '\u201c' + (hit.snippet || 'Section #' + hit.chunkIdx) + '\u2026\u201d';
+    row.appendChild(numEl);
+    row.appendChild(evidEl);
+    row.addEventListener('click', function() { scrollToChunk(hit.chunkIdx); });
+    fnBody.appendChild(row);
+  });
+
+  fnWrap.appendChild(fnToggle);
+  fnWrap.appendChild(fnBody);
+  msgDiv.appendChild(fnWrap);
+  el.chatMessages.scrollTop = el.chatMessages.scrollHeight;
+}
+
 function appendCtxFooter(msgDiv, refs) {
   const footer = document.createElement('div');
   footer.className = 'msg-ctx-footer';
@@ -1334,6 +1403,50 @@ function appendCtxFooter(msgDiv, refs) {
 }
 
 // ── Trace: post-hoc attribution ────────────────────────────────────────────
+function updateDeepChatBtn() {
+  const active = !!(S.currentUrl && S.pageHtmlCache[S.currentUrl]);
+  document.querySelectorAll('#deep-chat-btn').forEach(btn => {
+    btn.classList.toggle('active', active);
+    btn.title = active
+      ? 'Deep Chat ON — full page context + auto-trace (click to release)'
+      : 'Deep Chat — capture full page for context + auto-trace each reply';
+  });
+}
+
+async function autoRunTrace(msgDiv, reply, sources) {
+  const ind = document.createElement('span');
+  ind.className = 'trace-btn';
+  ind.textContent = 'TRACING…';
+  ind.style.opacity = '0.6';
+  msgDiv.appendChild(ind);
+  el.chatMessages.scrollTop = el.chatMessages.scrollHeight;
+  const activeSources = (sources && sources.length) ? sources : [];
+  const result = await new Promise(resolve =>
+    chrome.runtime.sendMessage({
+      type: 'TRACE',
+      payload: { reply, sources: activeSources, model: S.model },
+    }, resolve)
+  );
+  ind.remove();
+  if (!result || result.error) {
+    attachTraceButton(msgDiv, reply, activeSources);
+    return;
+  }
+  const valid = (result.attributions || []).filter(a =>
+    a && a.claim && a.claim.trim() && a.evidence && a.evidence.trim()
+  );
+  S.suppressHistoryRender = true;
+  chrome.tabs.query({ active: true, currentWindow: true }, tabs => {
+    const url = (tabs && tabs[0] && tabs[0].url) || S.currentUrl || '';
+    chrome.runtime.sendMessage({
+      type: 'TRACE_SAVE',
+      payload: { url, aiReply: reply, traceAttributions: valid },
+    }, () => { S.suppressHistoryRender = false; syncToDir().catch(() => {}); });
+  });
+  renderTraceAnnotations(msgDiv, valid, activeSources);
+  attachTraceButton(msgDiv, reply, activeSources, valid);
+}
+
 function attachTraceButton(msgDiv, reply, sources, priorAttributions) {
   const isRetrace = !!(priorAttributions && priorAttributions.length);
   const btn = document.createElement('button');
@@ -1346,20 +1459,11 @@ function attachTraceButton(msgDiv, reply, sources, priorAttributions) {
     const currentModel = S.model;  // capture model at click time
     btn.disabled = true;
     btn.textContent = 'TRACING\u2026';
-    // If no sources were captured, fall back to current page text
+    // If no sources were captured, use deep-mode cache if available (cache-optimized path)
     let activeSources = (sources && sources.length) ? sources : [];
-    if (!activeSources.length) {
-      try {
-        const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-        if (tab && tab.id && !tab.url.startsWith('chrome://')) {
-          const results = await chrome.scripting.executeScript({
-            target: { tabId: tab.id },
-            func: () => (document.body && document.body.innerText || '').trim().slice(0, 4000),
-          });
-          const pageText = results && results[0] && results[0].result;
-          if (pageText) activeSources = [{ text: pageText, url: tab.url, title: tab.title || tab.url }];
-        }
-      } catch(e) {}
+    if (!activeSources.length && S.pageHtmlCache[S.currentUrl]) {
+      const cached = S.pageHtmlCache[S.currentUrl];
+      activeSources = [{ text: cached.text, url: S.currentUrl, title: cached.title || S.currentUrl }];
     }
     if (!activeSources.length) {
       btn.textContent = 'NO SRC';
@@ -1830,7 +1934,6 @@ async function sendChatMessage() {
   const rawText = el.chatInp.value.trim();
   if (!rawText || S.chatBusy) return;
   hideAtHint();
-
   const { cleanText, resolvedCtxs, presetInstruction, presetKey } = parseInput(rawText);
   const text = cleanText;
 
@@ -1843,42 +1946,14 @@ async function sendChatMessage() {
     S.lastCtxSels.forEach(s => allSels.push(s));
   }
 
-  // Phase 0-A: full page text cached as { uid, text, title, createdAt }
-  const pageCtxCache = S.pageHtmlCache[S.currentUrl];
+  // Phase 0-A: full page text — sent only when cached via deep mode (cache-optimized path only)
+  const pageCtxCache = S.pageHtmlCache[S.currentUrl] || null;
   const pageCtxText = pageCtxCache ? pageCtxCache.text : null;
 
   // Deduplicate: if a selection is identical to the cached page text it's redundant (already in system)
   let dedupedSels = pageCtxText
     ? allSels.filter(s => s.text !== pageCtxText)
     : allSels.slice();
-
-  // Req 2: scripting fallback only when no explicit selections AND no cached page context
-  if (dedupedSels.length === 0 && !pageCtxText) {
-    try {
-      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-      if (tab && tab.id) {
-        const tabUrl = tab.url || '';
-        const isPdf  = /\.pdf(\?.*)?$/i.test(tabUrl) ||
-                       tabUrl.startsWith('chrome-extension://mhjfbmdgcfjbbpaeojofohoefgiehjai/');
-        if (isPdf) {
-          try {
-            const pdfUrl = isPdf && tabUrl.startsWith('chrome-extension://')
-              ? new URL(tabUrl).searchParams.get('url') || tabUrl
-              : tabUrl;
-            const pageText = await extractPdfText(pdfUrl);
-            if (pageText) dedupedSels.push({ text: '[PDF] ' + pageText, context: pageText });
-          } catch(pe) { ERR('PDF extract failed', pe); }
-        } else {
-          const results = await chrome.scripting.executeScript({
-            target: { tabId: tab.id },
-            func: () => (document.body && document.body.innerText || '').trim().slice(0, 5000),
-          });
-          const pageText = results && results[0] && results[0].result;
-          if (pageText) dedupedSels.push({ text: pageText, context: pageText });
-        }
-      }
-    } catch(e) { ERR('page text capture failed', e); }
-  }
 
   S.chatBusy = true;
   el.chatInp.value = '';
@@ -1975,7 +2050,12 @@ async function sendChatMessage() {
         }
         if (snapshotSels.length) appendCtxFooter(aiDiv, snapshotSels);
         aiDiv._originalText = reply;
-        attachTraceButton(aiDiv, reply, traceSrcs);
+        if (pageCtxText) {
+          const deepSrcs = [{ text: pageCtxText, url: S.currentUrl, title: S.currentTitle || S.currentUrl }];
+          autoRunTrace(aiDiv, reply, deepSrcs);
+        } else {
+          attachTraceButton(aiDiv, reply, traceSrcs);
+        }
         el.chatMessages.scrollTop = el.chatMessages.scrollHeight;
         if (snapshotSels.length > 0) S.lastCtxSels = snapshotSels.slice();
         // Update S.currentEntry immediately so subsequent messages use fresh history
