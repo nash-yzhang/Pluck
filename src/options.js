@@ -55,6 +55,12 @@ function applyI18n(lang, rerender) {
   $('hint-sync-folder').textContent  = _t.hintSyncFolder;
   $('export-json').textContent       = _t.exportBtn;
   $('import-json').textContent       = _t.importBtn;
+  $('section-update').textContent    = _t.sectionUpdate || 'UPDATE';
+  $('label-update-repo').textContent = _t.labelUpdateRepo || 'GITHUB REPO';
+  $('update-repo').placeholder       = _t.updateRepoPh || 'owner/repo';
+  $('save-update-repo').textContent  = _t.saveUpdateRepoBtn || 'SAVE REPO';
+  $('check-update').textContent      = _t.checkUpdateBtn || 'CHECK UPDATE';
+  $('mark-update-applied').textContent = _t.updateAppliedBtn || 'MARK APPLIED';
 
   $('setup-title').textContent  = _t.setupTitle;
   $('setup-text').textContent   = _t.setupText;
@@ -471,4 +477,99 @@ document.getElementById('import-file').addEventListener('change', function(e) {
   };
   reader.readAsText(file);
   e.target.value = '';
+});
+
+// ── Update section ─────────────────────────────────────────────────────────────
+var _updateStatus = document.getElementById('update-status');
+var _hardcodedRepo = 'nash-yzhang/Pluck';
+
+function showUpdateMsg(msg, ok) {
+  _updateStatus.textContent = msg;
+  _updateStatus.style.color = ok ? '#4dfa9a' : '#ff6655';
+}
+
+function getUpdateRepo() {
+  return _hardcodedRepo;
+}
+
+document.getElementById('update-repo').value = _hardcodedRepo;
+document.getElementById('update-repo').readOnly = true;
+document.getElementById('save-update-repo').disabled = true;
+
+document.getElementById('save-update-repo').addEventListener('click', function() {
+  showUpdateMsg(_hardcodedRepo, true);
+});
+
+document.getElementById('check-update').addEventListener('click', function() {
+  var repo = getUpdateRepo();
+  showUpdateMsg(_t.updateChecking || 'Checking...', true);
+  chrome.runtime.sendMessage({
+    type: 'CHECK_RELEASE_UPDATE',
+    payload: { prefix: 'RELEASE' },
+  }, function(resp) {
+    if (chrome.runtime.lastError) {
+      showUpdateMsg((_t.updateFailedPfx || 'Update check failed: ') + chrome.runtime.lastError.message, false);
+      return;
+    }
+    if (!resp || resp.error) {
+      showUpdateMsg((_t.updateFailedPfx || 'Update check failed: ') + ((resp && resp.error) || 'unknown error'), false);
+      return;
+    }
+    if (!resp.updateAvailable) {
+      showUpdateMsg((_t.updateLatest || 'Already latest RELEASE commit.') + '  ' + (resp.latest && resp.latest.shaShort ? resp.latest.shaShort : ''), true);
+      return;
+    }
+    var yes = confirm((_t.updateConfirmNow || 'Update found. Apply now?') + '\n' + (resp.latest.message || '') + '\n' + (resp.latest.shaShort || ''));
+    if (!yes) {
+      showUpdateMsg(_t.updateFound || 'New RELEASE commit found.', true);
+      return;
+    }
+    var msg = (_t.updateFound || 'New RELEASE commit found.') +
+      '\n' + (resp.latest.message || '') +
+      '\n' + (resp.latest.shaShort || '') +
+      '\n' + (resp.latest.date || '') +
+      '\n' + (resp.latest.url || '') +
+      '\nRun in local repo: ' + (resp.suggestedCommand || '');
+    showUpdateMsg(msg, true);
+  });
+});
+
+document.getElementById('mark-update-applied').addEventListener('click', function() {
+  chrome.runtime.sendMessage({ type: 'GET_PENDING_RELEASE_UPDATE' }, function(info) {
+    var pending = info && info.pending;
+    var sha = pending && pending.latest && pending.latest.sha;
+    if (!sha) {
+      showUpdateMsg(_t.updateLatest || 'Already latest RELEASE commit.', true);
+      return;
+    }
+    chrome.runtime.sendMessage({
+      type: 'CONFIRM_RELEASE_UPDATE_APPLIED',
+      payload: { sha: sha },
+    }, function(resp) {
+      if (!resp || !resp.ok) {
+        showUpdateMsg((_t.updateFailedPfx || 'Update check failed: ') + ((resp && resp.error) || 'unknown error'), false);
+        return;
+      }
+      showUpdateMsg(_t.updateMarked || 'Marked as applied.', true);
+    });
+  });
+});
+
+// Ask confirmation when startup auto-check already detected a pending release update.
+chrome.runtime.sendMessage({ type: 'GET_PENDING_RELEASE_UPDATE' }, function(info) {
+  var pending = info && info.pending;
+  if (!pending || !pending.latest) return;
+  var yes = confirm((_t.updateConfirmNow || 'Update found. Apply now?') + '\n' + (pending.latest.message || '') + '\n' + (pending.latest.shaShort || ''));
+  if (!yes) {
+    showUpdateMsg(_t.updateFound || 'New RELEASE commit found.', true);
+    return;
+  }
+  showUpdateMsg(
+    (_t.updateFound || 'New RELEASE commit found.') + '\n' +
+    (pending.latest.message || '') + '\n' +
+    (pending.latest.shaShort || '') + '\n' +
+    (pending.latest.date || '') + '\n' +
+    (pending.latest.url || '') + '\nRun in local repo: ' + (pending.suggestedCommand || ''),
+    true
+  );
 });

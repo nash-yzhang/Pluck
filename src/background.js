@@ -6,6 +6,7 @@ importScripts('providers.js');
 
 const LOG = (...a) => console.log('[CWA-BG]', ...a);
 const ERR = (...a) => console.error('[CWA-BG]', ...a);
+const CWA_RELEASE_REPO = 'nash-yzhang/Pluck';
 
 const CWA_EFFORTS = Object.freeze({
   instant:  { findChars: 3500,  traceChars: 3500,  evidenceChars: 2500, middleAnchors: 3, findCap: 34 },
@@ -627,6 +628,79 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
     });
     return true;
   }
+  if (msg.type === 'CHECK_RELEASE_UPDATE') {
+    (async () => {
+      try {
+        const repoRaw = CWA_RELEASE_REPO;
+        const prefix = msg && msg.payload && msg.payload.prefix ? String(msg.payload.prefix) : 'RELEASE';
+        const repo = repoRaw.replace(/^https?:\/\/github\.com\//i, '').replace(/\/+$/, '');
+        if (!repo || repo.indexOf('/') === -1) { respond({ error: 'Invalid hardcoded repo.' }); return; }
+        const commitsUrl = 'https://api.github.com/repos/' + repo + '/commits?per_page=100';
+        const res = await fetch(commitsUrl, { headers: { 'Accept': 'application/vnd.github+json' } });
+        if (!res.ok) { respond({ error: 'GitHub API ' + res.status }); return; }
+        const commits = await res.json();
+        const latest = (commits || []).find(function(c) {
+          var text = (((c || {}).commit || {}).message || '').trim();
+          return text.toUpperCase().indexOf(prefix.toUpperCase()) === 0;
+        });
+        if (!latest) { respond({ error: 'No commit found with prefix ' + prefix }); return; }
+        const sha = latest.sha || '';
+        const latestInfo = {
+          sha: sha,
+          shaShort: sha ? sha.slice(0, 8) : '',
+          message: ((((latest || {}).commit || {}).message || '').split('\n')[0] || '').trim(),
+          date: (((latest || {}).commit || {}).author || {}).date || '',
+          url: latest.html_url || '',
+        };
+        chrome.storage.sync.get(['cwaLastSeenReleaseSha', 'cwaLastAppliedReleaseSha'], function(r) {
+          var prev = r.cwaLastSeenReleaseSha || '';
+          var applied = r.cwaLastAppliedReleaseSha || '';
+          var updateAvailable = !!sha && sha !== applied;
+          chrome.storage.sync.set({ cwaLastSeenReleaseSha: sha }, function() {
+            if (updateAvailable) {
+              chrome.storage.local.set({
+                cwaPendingReleaseUpdate: {
+                  repo: repo,
+                  prefix: prefix,
+                  detectedAt: new Date().toISOString(),
+                  latest: latestInfo,
+                  suggestedCommand: 'git fetch origin && git cherry-pick ' + sha,
+                },
+              });
+            }
+            respond({
+              repo: repo,
+              prefix: prefix,
+              updateAvailable: updateAvailable,
+              previousSha: prev || null,
+              appliedSha: applied || null,
+              latest: latestInfo,
+              suggestedCommand: 'git fetch origin && git cherry-pick ' + sha,
+            });
+          });
+        });
+      } catch (e) {
+        respond({ error: e && e.message ? e.message : String(e) });
+      }
+    })();
+    return true;
+  }
+  if (msg.type === 'GET_PENDING_RELEASE_UPDATE') {
+    chrome.storage.local.get(['cwaPendingReleaseUpdate'], function(r) {
+      respond({ pending: r.cwaPendingReleaseUpdate || null });
+    });
+    return true;
+  }
+  if (msg.type === 'CONFIRM_RELEASE_UPDATE_APPLIED') {
+    const sha = msg && msg.payload && msg.payload.sha ? String(msg.payload.sha) : '';
+    if (!sha) { respond({ ok: false, error: 'Missing sha' }); return false; }
+    chrome.storage.sync.set({ cwaLastAppliedReleaseSha: sha }, function() {
+      chrome.storage.local.remove(['cwaPendingReleaseUpdate'], function() {
+        respond({ ok: true, appliedSha: sha });
+      });
+    });
+    return true;
+  }
   // AUTO_FIND hits relay: content.js → background → chrome.storage.session → sidepanel.js
   if (msg.type === 'AUTO_FIND_HITS') {
     chrome.storage.session.set({ cwaAutoFindHits: msg.hits });
@@ -1222,5 +1296,47 @@ async function appendToArchive(entries) {
 chrome.runtime.onInstalled.addListener(({ reason }) => {
   if (reason === 'install') chrome.runtime.openOptionsPage();
 });
+
+async function autoCheckReleaseUpdateOnStartup() {
+  try {
+    const r = await new Promise(resolve => chrome.storage.sync.get(['cwaAutoCheckUpdateOnStartup'], resolve));
+    const repoRaw = CWA_RELEASE_REPO;
+    const autoCheck = (r.cwaAutoCheckUpdateOnStartup !== false);
+    if (!autoCheck || !repoRaw || repoRaw.indexOf('/') === -1) return;
+    const repo = repoRaw.replace(/^https?:\/\/github\.com\//i, '').replace(/\/+$/, '');
+    const res = await fetch('https://api.github.com/repos/' + repo + '/commits?per_page=100', {
+      headers: { 'Accept': 'application/vnd.github+json' },
+    });
+    if (!res.ok) return;
+    const commits = await res.json();
+    const latest = (commits || []).find(function(c) {
+      var text = (((c || {}).commit || {}).message || '').trim();
+      return text.toUpperCase().indexOf('RELEASE') === 0;
+    });
+    if (!latest || !latest.sha) return;
+    const sha = latest.sha;
+    const latestInfo = {
+      sha: sha,
+      shaShort: sha.slice(0, 8),
+      message: ((((latest || {}).commit || {}).message || '').split('\n')[0] || '').trim(),
+      date: (((latest || {}).commit || {}).author || {}).date || '',
+      url: latest.html_url || '',
+    };
+    const mark = await new Promise(resolve => chrome.storage.sync.get(['cwaLastSeenReleaseSha', 'cwaLastAppliedReleaseSha'], resolve));
+    chrome.storage.sync.set({ cwaLastSeenReleaseSha: sha }, function() {});
+    if ((mark.cwaLastAppliedReleaseSha || '') === sha) return;
+    chrome.storage.local.set({
+      cwaPendingReleaseUpdate: {
+        repo: repo,
+        prefix: 'RELEASE',
+        detectedAt: new Date().toISOString(),
+        latest: latestInfo,
+        suggestedCommand: 'git fetch origin && git cherry-pick ' + sha,
+      },
+    }, function() {});
+  } catch (_) {}
+}
+
+autoCheckReleaseUpdateOnStartup();
 
 LOG('background started');

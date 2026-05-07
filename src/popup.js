@@ -4,6 +4,7 @@ chrome.storage.sync.get('cwaLanguage', function(r) {
   document.getElementById('menu-settings-text').textContent = t.menuSettings;
   document.getElementById('menu-capture-text').textContent  = t.menuCapture;
   document.getElementById('menu-toggle-text').textContent   = t.menuToggle;
+  document.getElementById('menu-update-text').textContent   = t.menuUpdate || 'Check Update';
 });
 
 document.getElementById('item-settings').addEventListener('click', function() {
@@ -37,4 +38,46 @@ document.getElementById('item-toggle').addEventListener('click', function() {
     });
   });
   window.close();
+});
+
+document.getElementById('item-update').addEventListener('click', function() {
+  chrome.storage.sync.get(['cwaLanguage'], function(r) {
+    var t = cwaT(r.cwaLanguage || 'en');
+    chrome.runtime.sendMessage({
+      type: 'CHECK_RELEASE_UPDATE',
+      payload: { prefix: 'RELEASE' },
+    }, function(resp) {
+      if (chrome.runtime.lastError) {
+        alert((t.updateFailedPfx || 'Update check failed: ') + chrome.runtime.lastError.message);
+        window.close();
+        return;
+      }
+      if (!resp || resp.error) {
+        alert((t.updateFailedPfx || 'Update check failed: ') + ((resp && resp.error) || 'unknown error'));
+        window.close();
+        return;
+      }
+      if (!resp.updateAvailable) {
+        alert((t.updateLatest || 'Already latest RELEASE commit.') + '\n' + (resp.latest && resp.latest.shaShort ? resp.latest.shaShort : ''));
+        window.close();
+        return;
+      }
+      var yes = confirm(
+        (t.updateConfirmNow || 'Update found. Apply now?') + '\n' +
+        (resp.latest.message || '') + '\n' +
+        (resp.latest.shaShort || '')
+      );
+      if (!yes) {
+        window.close();
+        return;
+      }
+      alert(
+        (t.updateFound || 'New RELEASE commit found.') + '\n' +
+        (resp.latest.message || '') + '\n' +
+        (resp.latest.shaShort || '') + '\n\n' +
+        'Run in local repo:\n' + (resp.suggestedCommand || '')
+      );
+      window.close();
+    });
+  });
 });
