@@ -1438,6 +1438,7 @@
     createAskFloat();
     _float.sel = selText || null;
     _float.firstQ = null; _float.firstA = null; _float.buf = '';
+    _float.effort = 'instant';
     _float.state = 'input';
 
     // Position 8px below bottom-right corner, clamped to viewport
@@ -1459,6 +1460,8 @@
     _float.sendBtn.style.borderColor = '#2a2a38';
     _float.statusTxt.textContent = 'READY';
     _float.statusDot.style.background = '#4dfa9a';
+    const effortBtn = _float.panel ? _float.panel.querySelector('button[title="Use balanced or deep mode for this page float"]') : null;
+    if (effortBtn) effortBtn.textContent = _float.effort.toUpperCase();
 
     chrome.storage.sync.get(['cwaModel'], function(r) {
       _float.model = r.cwaModel || 'gpt-4o';

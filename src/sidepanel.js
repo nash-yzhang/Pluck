@@ -186,7 +186,9 @@ async function init() {
   S.provider    = normalized.provider;
   S.model       = normalized.model;
   S.apiKeys     = normalized.apiKeys || {};
-  S.effort      = normalizeEffort(sync.cwaEffort);
+  // Sidebar mode is isolated from float and always starts from balanced.
+  S.effort      = 'balanced';
+  chrome.storage.sync.set({ cwaEffort: S.effort });
   S.displayDays = sync.cwaDisplayDays || 7;
   syncModelBadges();
   syncEffortButtons();
@@ -311,9 +313,10 @@ async function init() {
       }
       return;
     }
-    if (e.target.id === 'deep-chat-btn') {
+    const effortToggle = e.target && e.target.closest ? e.target.closest('#deep-chat-btn') : null;
+    if (effortToggle) {
       e.preventDefault();
-      showEffortMenu(e.target);
+      showEffortMenu(effortToggle);
     }
   });
 
@@ -460,11 +463,10 @@ async function onFloatHandoff(handoff) {
   if (!handoff) { HDBG('HANDOFF✗ handoff null'); return; }
   S.floatHandoffBusy = true;
   try {
-    if (handoff.effort) {
-      S.effort = normalizeEffort(handoff.effort);
-      chrome.storage.sync.set({ cwaEffort: S.effort });
-      syncEffortButtons();
-    }
+    // Keep sidebar effort independent from float effort.
+    // Float may run instant/deep per-question, but sidebar always resumes in balanced mode.
+    S.effort = 'balanced';
+    syncEffortButtons();
     const normUrl  = normalizeUrl(handoff.url || S.currentUrl);
     S.currentUrl   = normUrl;
     S.currentTitle = handoff.title || S.currentTitle;
@@ -1481,6 +1483,24 @@ function renderChatMessages(content) {
       }
     }
     const msgDiv = appendMsgEl(m.role, m.message, false, m.contextRefs || null, { effort: m.effort || S.effort });
+    if (m.role === 'assistant') {
+      // Backfill retry metadata for persisted history so effort pills always work.
+      const prevUser = i > 0 && content[i - 1] && content[i - 1].role === 'user' ? content[i - 1] : null;
+      if (prevUser && !msgDiv._retryPayload) {
+        msgDiv._userText = String(prevUser.message || '').replace(/\n\n\[try hard: [^\]]+\]\s*$/i, '');
+        msgDiv._retryPayload = {
+          prompt: msgDiv._userText,
+          url: S.currentUrl,
+          meta: { title: S.currentTitle || S.currentUrl, description: '' },
+          selections: (m.contextRefs || []).map(function(ref) { return { text: ref.text || ref.context || '', context: ref.context || ref.text || '' }; }).filter(function(ref) { return !!ref.text; }),
+          messages: content.slice(Math.max(0, i - 20), i - 1).map(function(mm) { return { role: mm.role, content: mm.message }; }),
+          model: S.model,
+          effort: normalizeEffort(m.effort || S.effort),
+          presetInstruction: null,
+          pageContext: null,
+        };
+      }
+    }
     // Restore saved trace annotations instead of showing TRACE button
     if (m.role === 'assistant' && m.traceAttributions && m.traceAttributions.length) {
       const traceBtn = msgDiv.querySelector('.trace-btn');
