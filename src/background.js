@@ -7,6 +7,21 @@ importScripts('providers.js');
 const LOG = (...a) => console.log('[CWA-BG]', ...a);
 const ERR = (...a) => console.error('[CWA-BG]', ...a);
 
+const CWA_EFFORTS = Object.freeze({
+  instant:  { findChars: 3500,  traceChars: 3500,  evidenceChars: 2500, middleAnchors: 3, findCap: 34 },
+  balanced: { findChars: 6000,  traceChars: 7000,  evidenceChars: 4500, middleAnchors: 5, findCap: 48 },
+  deep:     { findChars: 11000, traceChars: 14000, evidenceChars: 8000, middleAnchors: 9, findCap: 72 },
+});
+
+function normalizeEffort(effort) {
+  if (effort === 'cheap') return 'instant';
+  return CWA_EFFORTS[effort] ? effort : 'instant';
+}
+
+function getEffortBudget(effort) {
+  return CWA_EFFORTS[normalizeEffort(effort)];
+}
+
 // In-memory set of tabIds where the side panel is currently open.
 // Kept in sync with cwaSpOpen in session storage, but readable synchronously
 // so sidePanel.open() can be called without any async hop (preserves user-gesture context).
@@ -22,7 +37,7 @@ chrome.storage.session.onChanged.addListener(changes => {
 
 async function getConfig() {
   return new Promise(resolve => {
-    chrome.storage.sync.get(['cwaApiKey', 'cwaApiKeys', 'cwaModel', 'cwaProvider'], r => {
+    chrome.storage.sync.get(['cwaApiKey', 'cwaApiKeys', 'cwaModel', 'cwaProvider', 'cwaEffort'], r => {
       const normalized = cwaNormalizeSettings({
         provider: r.cwaProvider,
         model: r.cwaModel,
@@ -34,19 +49,236 @@ async function getConfig() {
         apiKey: normalized.apiKeys[normalized.provider] || '',
         apiKeys: normalized.apiKeys,
         model: normalized.model,
+        effort: normalizeEffort(r.cwaEffort),
       });
     });
   });
 }
 
+function normalizeText(s) {
+  return String(s || '').replace(/\s+/g, ' ').trim();
+}
+
+function _tokenize(text) {
+  const lower = String(text || '').toLowerCase();
+  const tokens = lower.match(/\w+/g) || [];
+  const cjkRe = /[\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff\u3040-\u30ff\uac00-\ud7af]/g;
+  let m;
+  while ((m = cjkRe.exec(lower)) !== null) {
+    tokens.push(m[0]);
+    const next = lower[m.index + 1];
+    if (next && /[\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff\u3040-\u30ff\uac00-\ud7af]/.test(next)) {
+      tokens.push(m[0] + next);
+    }
+  }
+  return tokens;
+}
+
+function _bm25Select(chunks, query, charBudget) {
+  const N = chunks.length;
+  if (!N) return { idxs: [], lowConf: false };
+  const qTokens = _tokenize(query);
+  if (!qTokens.length) {
+    const idxs = [];
+    let chars = 0;
+    const step = Math.max(1, Math.floor(N / 30));
+    for (let i = 0; i < N && chars < charBudget; i += step) {
+      idxs.push(chunks[i].idx);
+      chars += (chunks[i].text || '').length;
+    }
+    return { idxs, lowConf: true };
+  }
+  const df = {};
+  chunks.forEach(function(c) {
+    const seen = new Set(_tokenize(c.text || c.textPreview || ''));
+    seen.forEach(function(t) { df[t] = (df[t] || 0) + 1; });
+  });
+  const avgLen = Math.max(1, chunks.reduce(function(s, c) { return s + _tokenize(c.text || c.textPreview || '').length; }, 0) / N);
+  const scores = chunks.map(function(c) {
+    const tokens = _tokenize(c.text || c.textPreview || '');
+    const tf = {};
+    tokens.forEach(function(t) { tf[t] = (tf[t] || 0) + 1; });
+    let score = 0;
+    qTokens.forEach(function(qt) {
+      const f = tf[qt] || 0;
+      if (!f) return;
+      const d = df[qt] || 0;
+      const idf = Math.log((N - d + 0.5) / (d + 0.5) + 1);
+      score += idf * (f * 2.5) / (f + 1.5 * (0.25 + 0.75 * tokens.length / avgLen));
+    });
+    return { idx: c.idx, score };
+  }).sort(function(a, b) { return b.score - a.score; });
+  const lowConf = !scores.length || scores[0].score < 0.5;
+  const selected = new Set();
+  let chars = 0;
+  for (let i = 0; i < scores.length && chars < charBudget; i++) {
+    if (scores[i].score <= 0) break;
+    const c = chunks[scores[i].idx];
+    selected.add(scores[i].idx);
+    chars += c ? (c.text || c.textPreview || '').length : 0;
+  }
+  if (lowConf && chars < charBudget * 0.7) {
+    const step = Math.max(1, Math.floor(N / 25));
+    for (let i = 0; i < N && chars < charBudget; i += step) {
+      selected.add(chunks[i].idx);
+      chars += (chunks[i].text || '').length;
+    }
+  }
+  return { idxs: Array.from(selected), lowConf };
+}
+
+function simpleHash(text) {
+  let h = 2166136261;
+  const s = String(text || '');
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h += (h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24);
+  }
+  return (h >>> 0).toString(36);
+}
+
+function splitIntoSegments(text, maxLen) {
+  const clean = normalizeText(text);
+  if (!clean) return [];
+  const parts = clean.match(/[^.!?。！？\n]+[.!?。！？]?/g) || [clean];
+  const out = [];
+  let cur = '';
+  parts.forEach(function(p) {
+    p = p.trim();
+    if (!p) return;
+    if ((cur + ' ' + p).trim().length > maxLen && cur) {
+      out.push(cur.trim());
+      cur = p;
+    } else {
+      cur = (cur ? cur + ' ' : '') + p;
+    }
+  });
+  if (cur) out.push(cur.trim());
+  return out;
+}
+
+function makePlainChunks(text, title) {
+  const clean = normalizeText(text);
+  if (!clean) return [];
+  const chunks = [];
+  const size = 900, overlap = 140;
+  for (let start = 0; start < clean.length; start += size - overlap) {
+    const part = clean.slice(start, start + size).trim();
+    if (part.length < 40) continue;
+    const idx = chunks.length;
+    chunks.push({
+      idx,
+      text: part,
+      textFull: part,
+      textPreview: part.slice(0, 650),
+      headingPath: title || 'Page',
+      positionRatio: clean.length ? start / clean.length : 0,
+      tagName: 'text',
+      prevIdx: idx > 0 ? idx - 1 : null,
+      nextIdx: null,
+      hash: simpleHash(part),
+    });
+    if (idx > 0) chunks[idx - 1].nextIdx = idx;
+  }
+  return chunks;
+}
+
+function localSelectChunks(chunks, query, charBudget) {
+  const bm = _bm25Select(chunks, query || '', charBudget);
+  const selected = new Set(bm.idxs || []);
+  const lowerQ = normalizeText(query).toLowerCase();
+  const qTokens = _tokenize(lowerQ);
+  chunks.forEach(function(c) {
+    const heading = normalizeText(c.headingPath || c.heading || '').toLowerCase();
+    if (heading && qTokens.some(t => t.length > 1 && heading.indexOf(t) !== -1)) selected.add(c.idx);
+    if (lowerQ && normalizeText(c.text || '').toLowerCase().indexOf(lowerQ) !== -1) selected.add(c.idx);
+  });
+  if (bm.lowConf) {
+    [0.12, 0.35, 0.5, 0.65, 0.88].forEach(function(r) {
+      const idx = Math.min(chunks.length - 1, Math.max(0, Math.floor(chunks.length * r)));
+      if (chunks[idx]) selected.add(chunks[idx].idx);
+    });
+  }
+  const ordered = Array.from(selected).sort(function(a, b) { return a - b; });
+  const out = [];
+  let chars = 0;
+  ordered.forEach(function(i) {
+    const c = chunks[i];
+    if (!c || chars >= charBudget) return;
+    out.push(i);
+    chars += normalizeText(c.text || c.textPreview || '').length;
+  });
+  return { idxs: out, lowConf: bm.lowConf };
+}
+
+function buildEvidencePack(spans) {
+  return (spans || []).map(function(s) {
+    return '[' + s.spanId + ' | chunk ' + s.chunkIdx + ' | ' + Math.round((s.positionRatio || 0) * 100) + '% | ' +
+      (s.headingPath || 'Section') + ']\n' + s.evidence;
+  }).join('\n\n');
+}
+
+function verifyInlineSources(text, spans) {
+  if (!text || !spans || !spans.length) return text || '';
+  const byId = {};
+  spans.forEach(function(s) { byId[s.spanId] = s; });
+  return String(text).replace(/<src(?:\s+id=["']?([^"'>\s]+)["']?)?>([\s\S]*?)<\/src>/gi, function(full, id, ev) {
+    const evidence = normalizeText(ev);
+    let span = id && byId[id];
+    if (!span) {
+      span = spans.find(function(s) { return normalizeText(s.evidence).indexOf(evidence) !== -1 || evidence.indexOf(normalizeText(s.evidence)) !== -1; });
+    }
+    if (!span) return '[unverified]';
+    const sourceText = normalizeText(span.evidence);
+    if (sourceText.indexOf(evidence) === -1 && evidence.indexOf(sourceText) === -1) return '[unverified]';
+    return '<src id="' + span.spanId + '">' + evidence + '</src>';
+  });
+}
+
+function buildTraceCandidateSources(reply, sources, effort) {
+  const budget = getEffortBudget(effort);
+  const query = splitIntoSegments(reply || '', 220).slice(0, 12).join(' ');
+  const out = [];
+  let total = 0;
+  (sources || []).forEach(function(src, srcIdx) {
+    if (total >= budget.traceChars) return;
+    const chunks = src.chunks && src.chunks.length
+      ? src.chunks
+      : makePlainChunks(src.text || '', src.title || src.url || ('source ' + srcIdx));
+    const selected = localSelectChunks(chunks, query, Math.max(800, Math.floor(budget.traceChars / Math.max(1, sources.length))));
+    selected.idxs.forEach(function(chunkIdx) {
+      if (total >= budget.traceChars) return;
+      const c = chunks[chunkIdx];
+      if (!c) return;
+      const text = normalizeText(c.text || c.textFull || c.textPreview || '').slice(0, 900);
+      if (!text) return;
+      out.push({
+        srcIdx,
+        chunkIdx: c.idx,
+        title: src.title || '',
+        url: src.url || '',
+        text,
+        headingPath: c.headingPath || c.heading || '',
+        positionRatio: c.positionRatio || 0,
+      });
+      total += text.length;
+    });
+  });
+  return out;
+}
+
 function buildMessages(payload, provider) {
+  const effort = normalizeEffort(payload.effort);
+  const budget = getEffortBudget(effort);
   let baseSystem =
     'You are a browser-embedded web assistant. Be CONCISE and FAST.\n' +
     '- Lead with the answer, add detail only if essential.\n' +
     '- Use the page URL and title to infer context instantly.\n' +
     '- [Key] marks text the user highlighted — treat it as the primary focus.\n' +
     '- [Context] is the surrounding element/page content for reference.\n' +
-    '- Answer in the same language the user writes in.';
+    '- Answer in the same language the user writes in.\n' +
+    '- When page evidence is provided, do NOT rely only on the abstract or opening paragraphs. Important evidence may appear in the middle or end.\n' +
+    '- For every factual claim: cite a provided candidate span with <src id="sN">verbatim span</src>. If no candidate span supports the claim, append [unverified]. Never invent source text or span ids.';
 
   if (payload.presetInstruction) {
     baseSystem += '\n\nUser-selected instruction (apply to this response): ' + payload.presetInstruction;
@@ -79,14 +311,38 @@ function buildMessages(payload, provider) {
   }
 
   parts.push(`\nQuestion: ${payload.prompt}`);
+
+  if (payload.pageMap) {
+    parts.push('\n[Page Map]:\n' + payload.pageMap);
+  }
+  if (payload.middleAnchors) {
+    parts.push('\n[Middle Anchors]:\n' + payload.middleAnchors);
+  }
+  if (payload.candidateSpans && payload.candidateSpans.length) {
+    parts.push('\n[Candidate Spans — cite only these exact spans with <src id="sN">...</src>]:\n' + buildEvidencePack(payload.candidateSpans).slice(0, budget.evidenceChars + 1200));
+  }
   msgs.push({ role: 'user', content: parts.join('\n') });
 
   // Phase 0-B: build effective page context (base + delta)
   let effectivePageContext = payload.pageContext || null;
+  if (effort === 'instant' && effectivePageContext && payload.candidateSpans && payload.candidateSpans.length) {
+    effectivePageContext = null;
+  } else if (effectivePageContext && effort !== 'deep') {
+    effectivePageContext = effectivePageContext.slice(0, budget.evidenceChars);
+  }
   if (effectivePageContext && payload.pageDelta) {
     effectivePageContext += '\n\n[Page Update]:\n' + payload.pageDelta;
   } else if (!effectivePageContext && payload.pageDelta) {
     effectivePageContext = payload.pageDelta;
+  }
+
+  // Wrap page context with query anchors to mitigate "lost in the middle" attention bias.
+  // Echoing the question before and after the document helps the model scan the full text.
+  if (effectivePageContext && payload.prompt) {
+    effectivePageContext =
+      '[User question — keep this in mind while reading the full document below]:\n' + payload.prompt +
+      '\n\n' + effectivePageContext +
+      '\n\n[Reminder — answer the question above using the FULL document, not just the opening sections]:\n' + payload.prompt;
   }
 
   // For Claude: explicit prompt caching — system as array of blocks with cache_control.
@@ -239,6 +495,21 @@ async function streamAnthropic(apiKey, model, system, messages, onChunk) {
   return fullText;
 }
 
+function normalizeOpenAICompatibleBody(provider, body) {
+  const normalized = Object.assign({}, body);
+  const model = String(normalized.model || '');
+
+  // OpenAI GPT-5 chat-completions models only accept the default temperature.
+  if (provider === 'openai' && /^gpt-5(?:-|$)/.test(model) && normalized.temperature !== undefined && normalized.temperature !== 1) {
+    delete normalized.temperature;
+  }
+  if (provider === 'deepseek' && /(?:reasoner|v4)/.test(model) && normalized.temperature !== undefined && normalized.temperature !== 1) {
+    delete normalized.temperature;
+  }
+
+  return normalized;
+}
+
 async function streamProviderResponse(provider, apiKey, model, messageData, onChunk) {
   if (provider === 'claude') {
     return streamAnthropic(apiKey, model, messageData.system, messageData.messages, onChunk);
@@ -253,13 +524,14 @@ async function streamProviderResponse(provider, apiKey, model, messageData, onCh
 
 async function requestOpenAICompatibleJson(provider, apiKey, body) {
   const cfg = cwaGetProviderConfig(provider);
+  const normalizedBody = normalizeOpenAICompatibleBody(provider, body);
   const response = await fetch(cfg.endpoint, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       'Authorization': 'Bearer ' + apiKey,
     },
-    body: JSON.stringify(body),
+    body: JSON.stringify(normalizedBody),
   });
   if (!response.ok) throw new Error(await parseProviderError(response, cfg.label));
   return response.json();
@@ -332,7 +604,7 @@ chrome.runtime.onConnect.addListener(contentPort => {
         contentPort.postMessage({ type: 'CHUNK', chunk: delta });
       });
 
-      contentPort.postMessage({ type: 'DONE', reply: fullText });
+      contentPort.postMessage({ type: 'DONE', reply: verifyInlineSources(fullText, msg.payload.candidateSpans || []) });
       LOG('DONE reply_len=', fullText.length);
 
     } catch (e) {
@@ -457,6 +729,7 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
       // Panel already open — storage.onChanged in the panel picks up the handoff.
       // Calling sidePanel.open() again would reload/reset the panel.
       LOG('OPEN_SIDE_PANEL: panel already open for tab', tabId, '— skipping; handoff=', !!msg.handoff);
+      if (!msg.handoff && msg.goChat) chrome.storage.session.set({ cwaGoChat: { t: Date.now() } });
     } else {
       chrome.sidePanel.open({ tabId })
         .then(() => {
@@ -486,6 +759,11 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
     }
     return false;
   }
+  if (msg.type === 'IS_SIDE_PANEL_OPEN') {
+    const tabId = sender && sender.tab && sender.tab.id;
+    respond({ open: !!(tabId && spOpenTabs.has(tabId)) });
+    return false;
+  }
   // New context capture: relay to side panel
   if (msg.type === 'SEL_NEW') {
     chrome.storage.session.set({ cwaSelMsg: { type: 'SEL_NEW', payload: msg.payload, t: Date.now() } });
@@ -499,25 +777,27 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
   // ── Post-hoc attribution trace ─────────────────────────────────────────
   if (msg.type === 'TRACE') {
     (async () => {
-      const { apiKey, model, provider } = await getConfig();
+      const { apiKey, model, provider, effort: storedEffort } = await getConfig();
       if (!apiKey) { respond({ error: 'No API key set.' }); return; }
-      const { reply, sources, model: reqModel, priorAttributions } = msg.payload;
-      const srcBlock = sources.map((s, i) =>
-        `[${i}] ${s.title ? s.title + ' @ ' : ''}${s.url || 'source'}:\n${s.text.slice(0, 8000)}`
+      const { reply, sources, model: reqModel, priorAttributions, effort } = msg.payload;
+      const traceEffort = normalizeEffort(effort || storedEffort);
+      const traceCandidates = buildTraceCandidateSources(reply, sources, traceEffort);
+      const srcBlock = traceCandidates.map((s, i) =>
+        `[${i}] source=${s.srcIdx} chunk=${s.chunkIdx} pos=${Math.round((s.positionRatio || 0) * 100)}% ${s.title ? s.title + ' @ ' : ''}${s.url || 'source'}:\n${s.text}`
       ).join('\n\n');
       let prompt =
         'You are a citation attribution assistant. The AI reply and the source texts may be in DIFFERENT languages (e.g. reply in Chinese, sources in English). This is normal — the reply was generated from those sources via translation or paraphrase.\n\n' +
         'Task: go through the ENTIRE reply sentence by sentence, and for every factual claim or statement, find the passage in the numbered source texts that the claim was derived from.\n\n' +
         'You MUST cover ALL claims throughout the full reply — not just the first paragraph or first few sentences.\n\n' +
         'Return ONLY a valid JSON array (no markdown fences, no explanation):\n' +
-        '[{"claim":"short phrase copied verbatim from the reply","src":0,"evidence":"exact verbatim substring copied from the source text — do NOT translate, do NOT paraphrase, must be findable by substring search in the source"}]\n\n' +
+        '[{"claim":"short phrase copied verbatim from the reply","src":0,"chunkIdx":0,"confidence":0.8,"evidence":"exact verbatim substring copied from the source text — do NOT translate, do NOT paraphrase, must be findable by substring search in the source"}]\n\n' +
         'Critical rules:\n' +
         '- "evidence" MUST be a verbatim substring of the numbered source text. Copy it character-for-character.\n' +
         '- "evidence" is always in the SOURCE language, even if the reply is in a different language.\n' +
         '- "claim" is in the REPLY language, exactly as it appears in the reply.\n' +
         '- Cover claims from the beginning, middle, AND end of the reply.\n' +
         '- Only include claims with clear source support. If nothing is attributable, return [].\n' +
-        '- src is the 0-based index of the source.\n\n' +
+        '- src is the original source number shown as source= in the candidate block. chunkIdx is the candidate chunk number.\n\n' +
         'Reply:\n' + reply + '\n\nSources:\n' + srcBlock;
       if (priorAttributions && priorAttributions.length) {
         prompt +=
@@ -546,7 +826,18 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
           raw = (data.choices[0].message.content || '').trim();
         }
         raw = raw.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '').trim();
-        const attributions = JSON.parse(raw);
+        const attributions = (JSON.parse(raw) || []).map(function(a) {
+          const ev = normalizeText(a && a.evidence);
+          const cand = traceCandidates.find(function(c) {
+            return c.srcIdx === a.src && (normalizeText(c.text).indexOf(ev) !== -1 || ev.indexOf(normalizeText(c.text)) !== -1);
+          });
+          return Object.assign({}, a, {
+            src: cand ? cand.srcIdx : a.src,
+            chunkIdx: cand ? cand.chunkIdx : a.chunkIdx,
+            confidence: typeof a.confidence === 'number' ? a.confidence : (cand ? 0.75 : 0.25),
+            status: cand ? 'verified' : 'unverified',
+          });
+        });
         respond({ attributions });
       } catch(e) {
         ERR('TRACE error:', e.message);
@@ -556,97 +847,12 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
     return true;
   }
 
-  // ── BM25-lite pre-filter: char-budget selection with low-confidence structural fallback ─
-  // Returns { idxs: number[], lowConf: boolean }
-  // - Greedily fills charBudget by BM25 rank (no fixed topK cap).
-  // - lowConf=true when max BM25 score < 0.5 (vocabulary mismatch: query terms absent from page).
-  // - On lowConf, adds evenly-spaced structural coverage to fill remaining budget so large pages
-  //   are sampled across all sections rather than only the (wrong) BM25 top.
-  // Tokenize text for BM25: Latin words + CJK bigrams (handles Chinese/Japanese/Korean).
-  function _tokenize(text) {
-    const lower = text.toLowerCase();
-    const tokens = lower.match(/\w+/g) || [];
-    // CJK unified ideographs: U+4E00–U+9FFF and common extension ranges
-    const cjkRe = /[\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff\u3040-\u30ff\uac00-\ud7af]/g;
-    let m;
-    while ((m = cjkRe.exec(lower)) !== null) {
-      // emit each character as a unigram AND a bigram with the next character
-      tokens.push(m[0]);
-      const next = lower[m.index + 1];
-      if (next && /[\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff\u3040-\u30ff\uac00-\ud7af]/.test(next)) {
-        tokens.push(m[0] + next);
-      }
-    }
-    return tokens;
-  }
-
-  function _bm25Select(chunks, query, charBudget) {
-    const N = chunks.length;
-    if (!N) return { idxs: [], lowConf: false };
-    const qTokens = _tokenize(query);
-    // No query tokens: evenly sample to fill budget
-    if (!qTokens.length) {
-      const idxs = [];
-      let chars = 0;
-      const step = Math.max(1, Math.floor(N / 30));
-      for (let i = 0; i < N && chars < charBudget; i += step) {
-        idxs.push(chunks[i].idx);
-        chars += chunks[i].text.length;
-      }
-      return { idxs, lowConf: true };
-    }
-    const df = {};
-    chunks.forEach(function(c) {
-      const seen = new Set(_tokenize(c.text));
-      seen.forEach(function(t) { df[t] = (df[t] || 0) + 1; });
-    });
-    const avgLen = chunks.reduce(function(s, c) { return s + c.text.length; }, 0) / N;
-    const k1 = 1.5, b = 0.75;
-    const scores = chunks.map(function(c) {
-      const tokens = _tokenize(c.text);
-      const tf = {};
-      tokens.forEach(function(t) { tf[t] = (tf[t] || 0) + 1; });
-      const docLen = tokens.length;
-      let score = 0;
-      qTokens.forEach(function(qt) {
-        const f = tf[qt] || 0;
-        if (!f) return;
-        const idf = Math.log((N - (df[qt] || 0) + 0.5) / ((df[qt] || 0) + 0.5) + 1);
-        score += idf * (f * (k1 + 1)) / (f + k1 * (1 - b + b * docLen / avgLen));
-      });
-      return { idx: c.idx, score };
-    });
-    scores.sort(function(a, bv) { return bv.score - a.score; });
-    const maxScore = scores[0].score;
-    const lowConf = maxScore < 0.5;
-    // Fill budget greedily by BM25 rank
-    const selected = new Set();
-    let chars = 0;
-    for (let i = 0; i < scores.length && chars < charBudget; i++) {
-      if (scores[i].score <= 0) break;
-      const ci = scores[i].idx;
-      selected.add(ci);
-      chars += chunks[ci] ? chunks[ci].text.length : 0;
-    }
-    // Low-confidence: vocabulary mismatch — supplement with evenly-spaced structural coverage
-    // to sample all sections of the page rather than concentrating on the wrong area.
-    if (lowConf && chars < charBudget * 0.7) {
-      const step = Math.max(1, Math.floor(N / 25));
-      for (let i = 0; i < N && chars < charBudget; i += step) {
-        const ci = chunks[i].idx;
-        if (!selected.has(ci)) {
-          selected.add(ci);
-          chars += chunks[ci] ? chunks[ci].text.length : 0;
-        }
-      }
-    }
-    return { idxs: Array.from(selected), lowConf };
-  }
-
   // ── AI-powered on-page find (Alt+S panel fallback) ─────────────────────
   if (msg.type === 'FIND_ON_PAGE') {
     const tabId = sender.tab && sender.tab.id;
-    const { query, chunks, mode, searchId, bm25Only } = msg.payload;
+    const { query, chunks, mode, searchId, bm25Only, effort } = msg.payload;
+    const findEffort = normalizeEffort(effort);
+    const findBudget = getEffortBudget(findEffort);
     respond({ started: true }); // release the sendMessage callback immediately
     (async () => {
       const sendChunk = (chunkIdx, score) => {
@@ -655,10 +861,10 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
       // lowConf = vocabulary/language mismatch: use larger budget so LLM sees more candidates.
       // highConf = BM25 found keyword matches: tighter budget, stitch ±1 for boundary safety.
       const { idxs: rawIdxs, lowConf: isLowConf } = (function() {
-        const r1 = _bm25Select(chunks, query, 7000);
+        const r1 = _bm25Select(chunks, query, findBudget.findChars);
         if (r1.lowConf) return r1;
         // high-confidence: re-run with tighter budget for token savings
-        const r2 = _bm25Select(chunks, query, 3500);
+        const r2 = _bm25Select(chunks, query, Math.min(findBudget.findChars, Math.max(3500, Math.floor(findBudget.findChars * 0.65))));
         return { idxs: r2.idxs, lowConf: false };
       }());
       const stitchedSet = new Set(rawIdxs);
@@ -669,7 +875,7 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
         });
       }
       // lowConf: cap at 60 chunks (wide sweep); highConf: cap at 40
-      const hardCap = isLowConf ? 60 : 40;
+      const hardCap = isLowConf ? findBudget.findCap : Math.min(findBudget.findCap, 40);
       const selected = Array.from(stitchedSet).sort(function(a, b) { return a - b; }).slice(0, hardCap);
 
       // bm25Only: sidebar AUTO_FIND path — skip LLM entirely, highlight BM25 top results directly
@@ -882,7 +1088,10 @@ chrome.commands.onCommand.addListener((command, tab) => {
       });
     } else {
       chrome.sidePanel.open({ tabId: tab.id })
-        .then(() => { spOpenTabs.add(tab.id); chrome.storage.session.set({ cwaSpOpen: true }); })
+        .then(() => {
+          spOpenTabs.add(tab.id);
+          chrome.storage.session.set({ cwaSpOpen: true, cwaGoChat: { t: Date.now() } });
+        })
         .catch(e => ERR('sidePanel.open', e));
     }
   }
@@ -938,7 +1147,8 @@ async function saveHistoryEntry(payload) {
       context: contextTexts.filter(Boolean).join(' | ') },
     { timestamp: now + 1, role: 'assistant', message: aiReply,
       context: '', contextRefs: (payload.contextRefs || []),
-      traceAttributions: payload.traceAttributions || null },
+      traceAttributions: payload.traceAttributions || null,
+      searchSources: payload.searchSources || null },
   ];
 
   const idx = hist.entries.findIndex(e => e.url === normUrl);

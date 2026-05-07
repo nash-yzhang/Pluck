@@ -231,6 +231,7 @@
     .msg {
       padding: 5px 9px; border-radius: 3px; line-height: 1.65;
       white-space: pre-wrap; word-break: break-word; font-size: 12px;
+      position: relative;
     }
     .msg.user      { color: var(--u-fg); background: var(--u-bg); border-left: 2px solid var(--u-border); }
     .msg.user::before { content: '> '; opacity: .5; }
@@ -274,6 +275,15 @@
     }
     .msg.assistant a.search-link:hover { background: var(--accent); color: var(--bg); text-decoration: none; }
 
+    /* <src> evidence superscripts — clickable to highlight source span on page */
+    .msg.assistant sup.inline-src {
+      color: var(--accent); border: 1px solid var(--accent); border-radius: 2px;
+      padding: 0 2px; margin-left: 1px; font-size: 8px; line-height: 1;
+      cursor: pointer; user-select: none;
+      transition: background .12s, color .12s;
+    }
+    .msg.assistant sup.inline-src:hover { background: var(--accent); color: var(--bg); }
+
     /* Web search result message */
     .search-result-header {
       font-size: 10px; color: var(--ai-border); letter-spacing: 0.5px;
@@ -286,6 +296,10 @@
       line-height: 1; transition: background .12s, color .12s; user-select: none;
     }
     .search-cite:hover { background: var(--accent); color: var(--bg); }
+    .search-cite.search-cite-low {
+      color: var(--fg3, #888); border-color: var(--fg3, #888); cursor: default;
+    }
+    .search-cite.search-cite-low:hover { background: none; color: var(--fg3, #888); }
     .search-src-link {
       color: var(--ai-border); text-decoration: none; font-size: 10px;
       word-break: break-all; flex: 1;
@@ -393,6 +407,22 @@
       border-radius: 2px; color: var(--fg3); transition: all .15s;
     }
     .trace-btn:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+    .msg-action-row {
+      display: flex; gap: 6px; margin-top: 6px; flex-wrap: wrap; align-items: center;
+    }
+    .msg-action-row button {
+      background: none; border: 1px solid var(--border2); border-radius: 2px;
+      color: var(--fg3); font: 8px 'Cascadia Code', Consolas, monospace;
+      letter-spacing: .8px; padding: 2px 8px; cursor: pointer;
+    }
+    .msg-action-row button:hover { border-color: var(--accent); color: var(--accent); }
+    .msg-copy-btn {
+      display: none; position: absolute; right: 6px; bottom: 5px;
+      background: var(--bg2); border: 1px solid var(--border2); border-radius: 2px;
+      color: var(--fg3); font: 8px 'Cascadia Code', Consolas, monospace;
+      letter-spacing: .8px; padding: 1px 5px; cursor: pointer;
+    }
+    .msg.assistant:hover .msg-copy-btn { display: block; }
     #deep-chat-btn {
       font-family: inherit; font-size: 9px;
       letter-spacing: 1.5px; padding: 2px 6px; cursor: pointer;
@@ -401,6 +431,29 @@
     }
     #deep-chat-btn:hover { border-color: var(--accent); color: var(--accent); }
     #deep-chat-btn.active { border-color: var(--accent); color: var(--accent); background: rgba(77,250,154,.12); }
+    .cwa-pop-menu {
+      position: fixed; z-index: 2147483647; min-width: 150px; max-width: 260px;
+      background: var(--bg2); border: 1px solid var(--border2); border-radius: 3px;
+      box-shadow: 0 8px 30px rgba(0,0,0,.35); padding: 4px;
+      display: flex; flex-direction: column; gap: 2px;
+    }
+    .cwa-pop-menu button {
+      background: none; border: 1px solid transparent; color: var(--fg2);
+      font: 10px 'Cascadia Code', Consolas, monospace; text-align: left;
+      padding: 4px 6px; cursor: pointer; border-radius: 2px;
+    }
+    .cwa-pop-menu button:hover, .cwa-pop-menu button.active {
+      color: var(--accent); border-color: var(--accent); background: var(--accent-bg);
+    }
+    .cwa-pop-menu button:disabled {
+      color: var(--fg-dim); border-color: transparent; opacity: .45; cursor: not-allowed;
+      background: none;
+    }
+    .cwa-pop-menu .menu-label {
+      color: var(--fg3); font-size: 9px; letter-spacing: 1px;
+      padding: 5px 6px 2px; border-top: 1px solid var(--border);
+    }
+    .cwa-pop-menu .menu-label:first-child { border-top: none; }
     .trace-btn:disabled { opacity: .4; cursor: default; }
     .trace-empty { font-size: 10px; color: var(--fg3); margin-top: 6px; font-style: italic; }
     /* Inline superscript markers */
@@ -433,6 +486,10 @@
     .trace-fn-evid {
       font-size: 10px; color: var(--fg2); font-style: italic;
       white-space: pre-wrap; word-break: break-word; line-height: 1.5;
+    }
+    .inline-src-text {
+      font-size: 10px; color: var(--fg2);
+      white-space: pre-wrap; word-break: break-word; line-height: 1.5; flex: 1;
     }
 
     /* ctx-idx chip inside ctx-bar */
@@ -544,8 +601,8 @@
         <span id="g-stxt">READY</span>
       </div>
       <div style="display:flex;gap:6px;align-items:center">
-        <button id="deep-chat-btn" title="Deep Chat — send full page & auto-trace each reply">DEEP</button>
-        <button id="model-badge" class="model-badge" title="Click to cycle model">openai/gpt-4o-mini</button>
+        <button id="deep-chat-btn" title="Choose effort mode">BALANCED</button>
+        <button id="model-badge" class="model-badge" title="Click to choose provider/model">openai/gpt-4o-mini</button>
         <button id="gear-btn" class="gear-btn" title="Settings"></button>
       </div>
     </div>

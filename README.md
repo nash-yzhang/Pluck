@@ -80,8 +80,8 @@ Click the **model badge** in the sidebar header to cycle through all models for 
 
 | Provider | Models |
 |---|---|
-| **OpenAI** | `gpt-4o-mini` (default) · `gpt-4o` · `gpt-5-mini` |
-| **DeepSeek** | `deepseek-chat` · `deepseek-reasoner` |
+| **OpenAI** | `gpt-4o-mini` (default) · `gpt-5-nano` · `gpt-5-mini` · `gpt-4o` |
+| **DeepSeek** | `deepseek-v4-flash` (default) · `deepseek-v4-pro` · `deepseek-chat` (legacy) |
 | **Anthropic Claude** | `claude-3-5-haiku-latest` · `claude-3-5-sonnet-latest` |
 
 Switch providers any time in Settings. Each provider stores its own key independently.

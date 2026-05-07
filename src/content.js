@@ -31,6 +31,34 @@
   function openSidePanel(goChat, handoff) {
     chrome.runtime.sendMessage({ type: 'OPEN_SIDE_PANEL', goChat: !!goChat, handoff: handoff || null }).catch(() => {});
   }
+  function isSidePanelOpen(cb) {
+    try {
+      if (chrome.storage && chrome.storage.session && chrome.storage.session.get) {
+        chrome.storage.session.get('cwaSpOpen', function(d) {
+          if (d && d.cwaSpOpen) { cb(true); return; }
+          chrome.runtime.sendMessage({ type: 'IS_SIDE_PANEL_OPEN' }, function(resp) {
+            cb(!!(resp && resp.open));
+          });
+        });
+        return;
+      }
+    } catch(_) {}
+    chrome.runtime.sendMessage({ type: 'IS_SIDE_PANEL_OPEN' }, function(resp) {
+      cb(!!(resp && resp.open));
+    });
+  }
+  function sendSelection(type, captured) {
+    chrome.runtime.sendMessage({
+      type: type,
+      payload: {
+        text: captured.text,
+        context: captured.context || captured.text,
+        url: location.href,
+        title: document.title,
+        elementPick: !!captured._el,
+      },
+    }).catch(() => {});
+  }
   function toggleSidePanel() {
     chrome.runtime.sendMessage({ type: 'TOGGLE_SIDE_PANEL' }).catch(() => {});
   }
@@ -236,8 +264,31 @@
 
     // Visual pick mode
     let captured = null;
+    let appendMode = false;
     let isElement = false;
-    if (selText && _click.moved) {
+    if (e.shiftKey && _click.moved) {
+      const rect = {
+        left: Math.min(_click.x, e.clientX),
+        right: Math.max(_click.x, e.clientX),
+        top: Math.min(_click.y, e.clientY),
+        bottom: Math.max(_click.y, e.clientY),
+      };
+      const candidates = document.querySelectorAll('p,h1,h2,h3,h4,h5,h6,li,blockquote,td,th,figcaption,caption,article,section,div');
+      const picked = [];
+      for (let i = 0; i < candidates.length; i++) {
+        const el = candidates[i];
+        const r = el.getBoundingClientRect();
+        if (r.width < 8 || r.height < 8) continue;
+        if (r.right < rect.left || r.left > rect.right || r.bottom < rect.top || r.top > rect.bottom) continue;
+        const t = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+        if (t.length >= 12) picked.push(t);
+        if (picked.length >= 10) break;
+      }
+      const joined = picked.join('\n\n').slice(0, 4000).trim();
+      if (joined) {
+        captured = { text: joined, context: joined, rect: { left: rect.left, top: rect.top, width: rect.right - rect.left, height: rect.bottom - rect.top } };
+      }
+    } else if (selText && _click.moved) {
       // Text drag selection
       const parentEl = selObj.anchorNode && selObj.anchorNode.parentElement;
       const ctx = parentEl ? (parentEl.innerText || parentEl.textContent || '').trim() : selText;
@@ -247,7 +298,11 @@
       // Element click
       const el = e.target === _click.el ? e.target : _click.el;
       const text = (el.innerText || el.textContent || '').trim();
-      if (text) { captured = { text, context: text, rect: el.getBoundingClientRect(), _el: el }; isElement = true; }
+      if (text) {
+        captured = { text, context: text, rect: el.getBoundingClientRect(), _el: el };
+        isElement = true;
+        appendMode = !!e.ctrlKey;
+      }
     }
     _click = {};
     if (!captured) return;
@@ -256,9 +311,25 @@
     if (isElement) { SEL.lockElement(captured._el); }
     else            { SEL.lockText(); }
 
-    showSelToast(captured.text, false);
-    showAskFloat(captured.rect || null, captured.text);
+    finishCapturedSelection(captured, captured.rect || null, appendMode);
   }, true);
+
+  function finishCapturedSelection(captured, rect, appendMode) {
+    showSelToast(captured.text, !!appendMode);
+    isSidePanelOpen(function(opened) {
+      if (opened) {
+        sendSelection(appendMode ? 'SEL_APPEND' : 'SEL_NEW', captured);
+        openSidePanel(true);
+        if (!appendMode) SEL.reset();
+      } else {
+        let effectiveSel = captured.text;
+        if (appendMode && _float.sel) {
+          effectiveSel = (_float.sel + '\n\n' + captured.text).slice(0, 5000);
+        }
+        showAskFloat(rect, effectiveSel);
+      }
+    });
+  }
 
   function exitCopyMode() {
     S.copyMode = false;
@@ -289,7 +360,7 @@
       if (pgTxt && SEL.state === 'idle') {
         const pgRange = pgSel.rangeCount > 0 ? pgSel.getRangeAt(0) : null;
         SEL.lockText();
-        showAskFloat(pgRange ? pgRange.getBoundingClientRect() : null, pgTxt);
+        finishCapturedSelection({ text: pgTxt, context: pgTxt }, pgRange ? pgRange.getBoundingClientRect() : null);
         return;
       }
       if (SEL.state === 'picking') { SEL.reset(); return; }  // Alt+1 again = cancel
@@ -436,6 +507,7 @@
     visible: false, panel: null, inp: null, counter: null,
     slider: null, statusEl: null, modeLabel: null, _debounce: null,
     searchId: 0, pos: null, lastQuery: '', minScore: 1,
+    effort: 'instant',
     suppressAutoNav: false,  // true for AUTO_FIND from sidebar (no jarring scroll)
   };
 
@@ -586,6 +658,34 @@
     const statusEl = document.createElement('div');
     statusEl.style.cssText = 'font-size:9px;color:#606080;min-height:3px;line-height:10px;';  // ← adjust min-height here to change bottom clearance
 
+    const hardBtn = document.createElement('button');
+    hardBtn.textContent = _find.effort.toUpperCase();
+    hardBtn.title = 'Rerun this search with a larger retrieval budget';
+    hardBtn.style.cssText = 'align-self:flex-start;background:none;border:1px solid #2a2a38;border-radius:3px;color:#9090a0;font:9px monospace;letter-spacing:1px;padding:2px 6px;cursor:pointer;margin-top:2px;';
+    hardBtn.addEventListener('mouseenter', () => { hardBtn.style.borderColor = '#4dfa9a'; hardBtn.style.color = '#4dfa9a'; });
+    hardBtn.addEventListener('mouseleave', () => { hardBtn.style.borderColor = '#2a2a38'; hardBtn.style.color = '#9090a0'; });
+    hardBtn.addEventListener('mouseenter', function() {
+      _showEffortMenu(hardBtn, function(effort) {
+        _find.effort = effort;
+        hardBtn.textContent = _find.effort.toUpperCase();
+        if (_find.lastQuery || inp.value.trim()) {
+          _find.lastQuery = inp.value.trim() || _find.lastQuery;
+          doFind(_find.lastQuery);
+        }
+      });
+    });
+    hardBtn.addEventListener('click', function(e) {
+      e.preventDefault();
+      _showEffortMenu(hardBtn, function(effort) {
+        _find.effort = effort;
+        hardBtn.textContent = _find.effort.toUpperCase();
+        if (_find.lastQuery || inp.value.trim()) {
+          _find.lastQuery = inp.value.trim() || _find.lastQuery;
+          doFind(_find.lastQuery);
+        }
+      });
+    });
+
     inp.addEventListener('keydown', e => {
       if (e.key === 'Enter') { e.preventDefault(); e.shiftKey ? navigateFindMatch(-1) : navigateFindMatch(1); return; }
       if (e.key === 'Escape') { e.preventDefault(); hideFindPanel(); return; }
@@ -598,7 +698,7 @@
       _find._debounce = setTimeout(() => { _find.lastQuery = q; doFind(q); }, 800);
     });
 
-    panel.append(dragHandle, row1, row2, statusEl);
+    panel.append(dragHandle, row1, row2, statusEl, hardBtn);
     _find.panel = panel; _find.inp = inp; _find.counter = counter;
     _find.slider = slider; _find.statusEl = statusEl; _find.modeLabel = modeLabel;
     // Phase 1-C: reveal slider row on hover
@@ -720,6 +820,7 @@
     if (_pageChunkCache[url]) return _pageChunkCache[url];
     const els = document.querySelectorAll('p,h1,h2,h3,h4,h5,h6,li,blockquote,td,th,figcaption,caption');
     const chunks = [];
+    let currentHeading = '';
     for (let i = 0; i < els.length; i++) {
       const el = els[i];
       let inPanel = false, anc = el;
@@ -728,14 +829,31 @@
       if (_isNoisyAncestor(el)) continue;
       const text = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
       if (text.length < 20) continue;
-      chunks.push({ idx: chunks.length, text: text.slice(0, 500), el });
+      const tagName = (el.tagName || '').toLowerCase();
+      if (/^h[1-6]$/.test(tagName)) currentHeading = text.slice(0, 120);
+      const idx = chunks.length;
+      const positionRatio = els.length ? i / els.length : 0;
+      chunks.push({
+        idx,
+        textFull: text,
+        textPreview: text.slice(0, 650),
+        text: text.slice(0, 650),
+        headingPath: currentHeading || document.title || 'Page',
+        positionRatio,
+        tagName,
+        prevIdx: idx > 0 ? idx - 1 : null,
+        nextIdx: null,
+        hash: String(text.length) + ':' + text.slice(0, 24),
+        el,
+      });
+      if (idx > 0) chunks[idx - 1].nextIdx = idx;
     }
     _pageChunkCache[url] = chunks;
     return chunks;
   }
 
   function _doFindAI(query, mode, searchId, bm25Only) {
-    if (_find.statusEl) _find.statusEl.textContent = '\u23f3\u00a0AI searching\u2026';
+    if (_find.statusEl) _find.statusEl.textContent = '\u23f3\u00a0AI searching (' + _find.effort + ')\u2026';
     if (!_findHighlights.length && _find.counter) _find.counter.textContent = 'AI\u2026';
 
     const url = location.href;
@@ -756,7 +874,7 @@
     }
 
     chrome.runtime.sendMessage(
-      { type: 'FIND_ON_PAGE', payload: { query, chunks: chunks.map(function(c) { return { idx: c.idx, text: c.text }; }), mode, searchId, bm25Only: !!bm25Only } },
+      { type: 'FIND_ON_PAGE', payload: { query, chunks: chunks.map(function(c) { return { idx: c.idx, text: c.text, headingPath: c.headingPath, positionRatio: c.positionRatio, textPreview: c.textPreview }; }), mode, searchId, bm25Only: !!bm25Only, effort: bm25Only ? 'instant' : _find.effort } },
       function(resp) { if (chrome.runtime.lastError) ERR('FIND_ON_PAGE send:', chrome.runtime.lastError.message); }
     );
   }
@@ -1126,6 +1244,35 @@
     updateFindCounter();
   }
 
+  function _removeFloatMenus() {
+    document.querySelectorAll('.cwa-effort-menu').forEach(m => m.remove());
+  }
+
+  function _showEffortMenu(anchor, onPick) {
+    _removeFloatMenus();
+    const menu = document.createElement('div');
+    menu.className = 'cwa-effort-menu';
+    menu.style.cssText = 'position:fixed;z-index:2147483647;background:#18181b;border:1px solid #3a3a50;border-radius:4px;padding:4px;display:flex;flex-direction:column;gap:2px;box-shadow:0 8px 28px rgba(0,0,0,.45);';
+    ['balanced', 'deep'].forEach(function(effort) {
+      const b = document.createElement('button');
+      b.textContent = effort.toUpperCase();
+      b.style.cssText = 'background:none;border:1px solid transparent;color:#d0d0d8;font:10px monospace;padding:4px 8px;text-align:left;cursor:pointer;border-radius:2px;';
+      b.addEventListener('mouseenter', () => { b.style.borderColor = '#4dfa9a'; b.style.color = '#4dfa9a'; });
+      b.addEventListener('mouseleave', () => { b.style.borderColor = 'transparent'; b.style.color = '#d0d0d8'; });
+      b.addEventListener('click', function(e) {
+        e.stopPropagation();
+        onPick(effort);
+        _removeFloatMenus();
+      });
+      menu.appendChild(b);
+    });
+    document.body.appendChild(menu);
+    const r = anchor.getBoundingClientRect();
+    menu.style.left = Math.max(4, Math.min(window.innerWidth - menu.offsetWidth - 4, r.left)) + 'px';
+    menu.style.top = Math.max(4, r.bottom + 4) + 'px';
+    setTimeout(() => document.addEventListener('click', _removeFloatMenus, { once: true }), 0);
+  }
+
   // ── Phase 2: Inline Ask Float ───────────────────────────────────────────
   const _float = {
     panel: null, textarea: null, replyDiv: null, sendBtn: null, modelBadge: null,
@@ -1133,7 +1280,7 @@
     state: 'idle',  // idle | input | streaming | done_first
     port: null, buf: '',
     firstQ: null, firstA: null, sel: null,
-    model: null, pos: null,
+    model: null, pos: null, effort: 'instant',
   };
 
   function _floatClamp(x, y, w, h) {
@@ -1209,8 +1356,8 @@
     modelBadge.style.cssText = 'background:none;border:1px solid #3a3a50;border-radius:2px;color:#7090b0;font:9px monospace;padding:2px 5px;cursor:pointer;letter-spacing:1px;transition:all .15s;flex-shrink:0;';
     modelBadge.title = 'Click to cycle model';
     const _FLOAT_MODELS = [
-      ['gpt-4o-mini','openai'],['gpt-5-mini','openai'],['gpt-4o','openai'],
-      ['deepseek-chat','deepseek'],['deepseek-reasoner','deepseek'],
+      ['gpt-4o-mini','openai'],['gpt-5-nano','openai'],['gpt-5-mini','openai'],['gpt-4o','openai'],
+      ['deepseek-v4-flash','deepseek'],['deepseek-v4-pro','deepseek'],['deepseek-chat','deepseek'],
       ['claude-3-5-haiku-latest','claude'],['claude-3-5-sonnet-latest','claude'],
     ];
     modelBadge.addEventListener('click', function() {
@@ -1219,6 +1366,23 @@
       _float.model = next[0];
       modelBadge.textContent = next[0].split('/').pop().slice(0, 18).toUpperCase();
       chrome.storage.sync.set({ cwaModel: next[0], cwaProvider: next[1] });
+    });
+    const effortBtn = document.createElement('button');
+    effortBtn.textContent = _float.effort.toUpperCase();
+    effortBtn.title = 'Use balanced or deep mode for this page float';
+    effortBtn.style.cssText = 'background:none;border:1px solid #3a3a50;border-radius:2px;color:#7090b0;font:9px monospace;padding:2px 5px;cursor:pointer;letter-spacing:1px;transition:all .15s;flex-shrink:0;';
+    effortBtn.addEventListener('mouseenter', function() {
+      _showEffortMenu(effortBtn, function(effort) {
+        _float.effort = effort;
+        effortBtn.textContent = effort.toUpperCase();
+      });
+    });
+    effortBtn.addEventListener('click', function(e) {
+      e.preventDefault();
+      _showEffortMenu(effortBtn, function(effort) {
+        _float.effort = effort;
+        effortBtn.textContent = effort.toUpperCase();
+      });
     });
     const statusDot = document.createElement('span');
     statusDot.style.cssText = 'width:5px;height:5px;border-radius:50%;background:#4dfa9a;flex-shrink:0;';
@@ -1236,6 +1400,7 @@
       const handoff = {
         firstQ: _float.firstQ, firstA: _float.firstA,
         secondQ: _float.textarea ? _float.textarea.value.trim() : '',
+        effort: _float.effort || 'instant',
         selection: _float.sel, url: location.href, title: document.title,
       };
       console.log('[CWA-FLOAT] maximizeBtn: sending handoff via OPEN_SIDE_PANEL; firstQ=', !!handoff.firstQ, 'firstA=', !!handoff.firstA);
@@ -1262,7 +1427,7 @@
     closeBtn.title = 'Close';
     closeBtn.style.cssText = 'background:none;border:none;color:#ff5e57;font:14px monospace;cursor:pointer;padding:0 3px;line-height:1;flex-shrink:0;';
     closeBtn.addEventListener('click', () => hideAskFloat(true));
-    footer.append(modelBadge, statusDot, statusTxt, maximizeBtn, sendBtn, closeBtn);
+    footer.append(modelBadge, effortBtn, statusDot, statusTxt, maximizeBtn, sendBtn, closeBtn);
 
     panel.append(drag, replyDiv, textarea, footer);
     document.body.appendChild(panel);
@@ -1345,6 +1510,7 @@
         firstQ:    _float.firstQ,
         firstA:    _float.firstA,
         secondQ:   q,
+        effort:    _float.effort || 'instant',
         selection: _float.sel,
         url:       location.href,
         title:     document.title,
@@ -1375,6 +1541,7 @@
       selections: _float.sel ? [{ text: _float.sel, context: _float.sel }] : [],
       messages:   [],
       model:      _float.model || 'gpt-4o',
+      effort:     _float.effort || 'instant',
       presetInstruction: null,
       pageContext: null,
     };

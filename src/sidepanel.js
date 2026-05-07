@@ -13,6 +13,12 @@ const ERR = (...a) => console.error('[CWA-SP]', ...a);
 const HISTORY_KEY  = 'cwaHistory';
 const CTX_STORE_KEY = 'cwaCtxStore';
 const PAGE_SIZE    = 10;
+const EFFORTS = ['instant', 'balanced', 'deep'];
+const EFFORT_BUDGETS = {
+  instant:  { evidenceChars: 2500, middleAnchors: 3 },
+  balanced: { evidenceChars: 4500, middleAnchors: 5 },
+  deep:     { evidenceChars: 8000, middleAnchors: 9 },
+};
 
 const DEFAULT_PRESETS = {
   sum:       'Summarize the selected text into bare key points. No formatting, no filler. Match the language of the user prompt; if absent, match the selected text\'s language.',
@@ -38,6 +44,8 @@ const S = {
   displayedCount:    PAGE_SIZE,
   provider:          'openai',
   model:             'gpt-4o-mini',
+  apiKeys:           {},
+  effort:            'balanced',
   displayDays:       7,
   chatBusy:          false,
   pendingSelections: [],   // legacy; now ctx references by ID
@@ -104,6 +112,16 @@ function HDBG(...args) {
   _dbgLines.scrollTop = _dbgLines.scrollHeight;
 }
 
+function normalizeEffort(effort) {
+  if (effort === 'cheap') return 'instant';
+  return EFFORTS.indexOf(effort) >= 0 ? effort : 'balanced';
+}
+
+function nextEffort(effort) {
+  const idx = EFFORTS.indexOf(normalizeEffort(effort));
+  return EFFORTS[Math.min(EFFORTS.length - 1, idx + 1)];
+}
+
 document.addEventListener('keydown', function(e) {
   if (e.altKey && e.key === 'F12') {
     e.preventDefault();
@@ -158,7 +176,7 @@ async function init() {
   chrome.storage.session.set({ cwaSpOpen: true });
   window.addEventListener('pagehide', () => chrome.storage.session.set({ cwaSpOpen: false }));
 
-  const sync = await chromeSGet(['cwaApiKey', 'cwaApiKeys', 'cwaProvider', 'cwaModel', 'cwaDisplayDays', 'cwaPresets']);
+  const sync = await chromeSGet(['cwaApiKey', 'cwaApiKeys', 'cwaProvider', 'cwaModel', 'cwaEffort', 'cwaDisplayDays', 'cwaPresets']);
   const normalized = cwaNormalizeSettings({
     provider: sync.cwaProvider,
     model: sync.cwaModel,
@@ -167,8 +185,11 @@ async function init() {
   });
   S.provider    = normalized.provider;
   S.model       = normalized.model;
+  S.apiKeys     = normalized.apiKeys || {};
+  S.effort      = normalizeEffort(sync.cwaEffort);
   S.displayDays = sync.cwaDisplayDays || 7;
   syncModelBadges();
+  syncEffortButtons();
 
   S.presets = Object.assign({}, DEFAULT_PRESETS, sync.cwaPresets || {});
   LOG('presets loaded:', Object.keys(S.presets).join(', '));
@@ -179,7 +200,7 @@ async function init() {
   el.chatSbarSlot.replaceWith(sbarClone);
 
   // Wire events
-  el.modelBadge.addEventListener('click', cycleModel);
+  el.modelBadge.addEventListener('click', showModelMenu);
   el.gearBtn.addEventListener('click', () => chrome.runtime.openOptionsPage());
   el.currentBar.addEventListener('click', navigateToCurrent);
   el.loadMore.addEventListener('click', onLoadMore);
@@ -196,9 +217,9 @@ async function init() {
     if (e.key === 'Delete' && S.view === 'list' && !el.delConfirm.classList.contains('show')) {
       if (S.selectedUrls.size) { e.preventDefault(); showDelConfirm(); }
     }
-    // Req 3: Alt+S or Alt+` — close/toggle sidebar even when sidebar is focused
+    // Req 3: Alt+` — close/toggle sidebar even when sidebar is focused
     const isToggle = e.altKey && !e.ctrlKey && !e.shiftKey &&
-                     (e.code === 'KeyS' || e.code === 'Backquote');
+                     (e.code === 'Backquote');
     if (isToggle) {
       e.preventDefault();
       LOG('DEBUG sidepanel keydown toggle: e.code=', e.code, 'e.key=', e.key,
@@ -221,14 +242,78 @@ async function init() {
     sendChatMessage();
   });
   document.addEventListener('click', e => {
-    if (e.target.id === 'deep-chat-btn') {
-      if (S.pageHtmlCache[S.currentUrl]) {
-        // Deactivate: evict cache for this URL so full page is no longer sent
-        delete S.pageHtmlCache[S.currentUrl];
-        updateDeepChatBtn();
-      } else {
-        autoCapturePageCtx().catch(() => {});
+    // <src> evidence superscripts — click to highlight span on active page
+    const srcSup = e.target.closest('sup.inline-src');
+    if (srcSup) {
+      const evidence = srcSup.dataset.ev;
+      if (evidence) {
+        chrome.tabs.query({ active: true, currentWindow: true }, tabs => {
+          if (!tabs[0] || !tabs[0].id) return;
+          chrome.scripting.executeScript({
+            target: { tabId: tabs[0].id },
+            func: ev => {
+              document.querySelectorAll('.cwa-trace-hl').forEach(m => {
+                if (!m.parentNode) return;
+                while (m.firstChild) m.parentNode.insertBefore(m.firstChild, m);
+                m.parentNode.removeChild(m);
+              });
+              const norm = s => s.replace(/\s+/g, ' ').trim();
+              const normEv = norm(ev);
+              const HL = 'background:#ffe066 !important;color:#000 !important;border-radius:2px;outline:1px solid #ffb300;';
+              for (const needle of [normEv, normEv.slice(0, 120), normEv.slice(0, 60)]) {
+                if (!needle) continue;
+                if (!window.find(needle, false, false, true, false, false, false)) continue;
+                const sel = window.getSelection();
+                if (!sel || !sel.rangeCount) continue;
+                const range = sel.getRangeAt(0).cloneRange();
+                sel.removeAllRanges();
+                const mark = document.createElement('mark');
+                mark.className = 'cwa-trace-hl';
+                mark.style.cssText = HL;
+                try { range.surroundContents(mark); } catch (_) {
+                  const sp = document.createElement('mark');
+                  sp.className = 'cwa-trace-hl';
+                  sp.style.cssText = HL;
+                  range.collapse(true);
+                  range.insertNode(sp);
+                  sp.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                  return;
+                }
+                mark.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                return;
+              }
+            },
+            args: [evidence],
+          }).catch(() => {
+            chrome.tabs.sendMessage(tabs[0].id, { type: 'HIGHLIGHT_TRACES', snippets: [evidence] }).catch(() => {});
+          });
+        });
       }
+      return;
+    }
+    // [N] web-search citation superscripts — click to open source URL
+    const citeSup = e.target.closest('sup.search-cite');
+    if (citeSup && !citeSup.classList.contains('search-cite-low')) {
+      e.preventDefault();
+      const url = citeSup.dataset.url;
+      if (url) chrome.tabs.create({ url });
+      return;
+    }
+    // [SEARCH: ...] pill links generated by LLM
+    const searchLink = e.target.closest('a.search-link');
+    if (searchLink) {
+      e.preventDefault();
+      const q = searchLink.dataset.searchQuery;
+      if (q) {
+        el.chatInp.value = q;
+        autoResizeTextarea();
+        el.chatInp.focus();
+      }
+      return;
+    }
+    if (e.target.id === 'deep-chat-btn') {
+      e.preventDefault();
+      showEffortMenu(e.target);
     }
   });
 
@@ -263,7 +348,7 @@ async function init() {
     if (e.key === 'Escape') hideAtHint();
   });
   el.chatInp.addEventListener('input', () => { autoResizeTextarea(); updateMirror(); checkInputHint(); });
-  document.getElementById('chat-sbar-clone').querySelector('.model-badge').addEventListener('click', cycleModel);
+  document.getElementById('chat-sbar-clone').querySelector('.model-badge').addEventListener('click', showModelMenu);
   document.getElementById('chat-sbar-clone').querySelector('.gear-btn').addEventListener('click', () => chrome.runtime.openOptionsPage());
 
   // Load context store
@@ -316,8 +401,13 @@ async function init() {
           });
           S.provider = normalized.provider;
           S.model = normalized.model;
+          S.apiKeys = normalized.apiKeys || {};
           syncModelBadges();
         });
+      }
+      if (changes.cwaEffort) {
+        S.effort = normalizeEffort(changes.cwaEffort.newValue);
+        syncEffortButtons();
       }
       if (changes.cwaDisplayDays) { S.displayDays = changes.cwaDisplayDays.newValue || 7; refreshList(); }
       if (changes.cwaPresets) {
@@ -370,6 +460,11 @@ async function onFloatHandoff(handoff) {
   if (!handoff) { HDBG('HANDOFF✗ handoff null'); return; }
   S.floatHandoffBusy = true;
   try {
+    if (handoff.effort) {
+      S.effort = normalizeEffort(handoff.effort);
+      chrome.storage.sync.set({ cwaEffort: S.effort });
+      syncEffortButtons();
+    }
     const normUrl  = normalizeUrl(handoff.url || S.currentUrl);
     S.currentUrl   = normUrl;
     S.currentTitle = handoff.title || S.currentTitle;
@@ -384,6 +479,7 @@ async function onFloatHandoff(handoff) {
     const floatPair = (handoff.firstQ && handoff.firstA) ? [
       { timestamp: Date.now() - 1, role: 'user',      message: handoff.firstQ, context: handoff.selection || '' },
       { timestamp: Date.now(),     role: 'assistant', message: handoff.firstA, context: '',
+        effort: normalizeEffort(handoff.effort || S.effort),
         contextRefs: handoff.selection ? [{ text: handoff.selection, url: normUrl, title: handoff.title }] : [] },
     ] : [];
     HDBG('HANDOFF▶ floatPair.length=', floatPair.length);
@@ -634,8 +730,8 @@ async function autoCapturePageCtx() {
 //  Selection messages from content.js 
 function onSelMsg(msg) {
   if (!msg) return;
-  if (msg.type === 'SEL_NEW') {
-    const { text, url, title, elementPick } = msg.payload;
+  if (msg.type === 'SEL_NEW' || msg.type === 'SEL_APPEND') {
+    const { text, context, url, title, elementPick } = msg.payload;
     // Cancel auto-captured page ctx when user explicitly element-picks
     if (elementPick && S.autoCtxId) {
       const autoUrl = S.ctxStore[S.autoCtxId] && S.ctxStore[S.autoCtxId].url;
@@ -658,6 +754,9 @@ function onSelMsg(msg) {
     }
     const id = nextCtxId(url || S.currentUrl);
     S.ctxStore[id] = { text, url: url || S.currentUrl, title: title || S.currentTitle, createdAt: Date.now() };
+    const pillCtx = { id, text, context: context || text };
+    S.pendingSelections = (msg.type === 'SEL_NEW' ? [] : S.pendingSelections).filter(Boolean);
+    S.pendingSelections.push(pillCtx);
     // Persist
     chrome.storage.local.get(CTX_STORE_KEY, d => {
       const store = d[CTX_STORE_KEY] || {};
@@ -673,8 +772,7 @@ function onSelMsg(msg) {
     if (S.view === 'chat') inp.focus();
   }
   // Legacy relay support
-  if (msg.type === 'SEL_SET')    S.pendingSelections = [msg.payload];
-  if (msg.type === 'SEL_APPEND') S.pendingSelections.push(msg.payload);
+  if (msg.type === 'SEL_SET') S.pendingSelections = [msg.payload];
   if (S.view === 'chat') renderCtxBar();
 }
 
@@ -682,12 +780,26 @@ function renderCtxBar() {
   const ctx = S.pendingSelections.filter(Boolean);
   if (!ctx.length) { el.chatCtxBar.style.display = 'none'; return; }
   el.chatCtxBar.style.display = 'flex';
-  el.chatCtxItems.innerHTML = ctx.map((c, i) =>
-    '<span class="ctx-badge" title="' + escAttr(c.text) + '">' +
-    '<span class="ctx-idx">@' + (i+1) + '</span>' +
-    esc(c.text.slice(0, 20)) + (c.text.length > 20 ? '\u2026' : '') +
-    '</span>'
-  ).join('');
+  el.chatCtxItems.innerHTML = '';
+  ctx.forEach(function(c, i) {
+    const badge = document.createElement('span');
+    badge.className = 'ctx-badge';
+    const cid = c.id || (i + 1);
+    badge.innerHTML = '<span class="ctx-idx">@' + esc(String(cid)) + '</span>' +
+      esc((c.text || '').slice(0, 20)) + ((c.text || '').length > 20 ? '\u2026' : '');
+    badge.title = (c.text || '').slice(0, 200);
+    badge.style.cursor = 'pointer';
+    badge.addEventListener('click', function() {
+      const existing = badge.nextSibling && badge.nextSibling.classList && badge.nextSibling.classList.contains('ctx-ref-preview')
+        ? badge.nextSibling : null;
+      if (existing) { existing.remove(); return; }
+      const preview = document.createElement('div');
+      preview.className = 'ctx-ref-preview';
+      preview.textContent = c.context || c.text || '';
+      badge.insertAdjacentElement('afterend', preview);
+    });
+    el.chatCtxItems.appendChild(badge);
+  });
 }
 
 //  Hint dropdown helpers 
@@ -1242,6 +1354,111 @@ function openChatView(entry) {
   setTimeout(() => el.chatInp.focus(), 50);
 }
 
+// Convert [N] citation markers in already-rendered HTML to clickable superscripts.
+// Valid source index → <sup class="search-cite"> linked to source URL.
+// Out-of-range index → <sup class="search-cite search-cite-low"> with ? to flag hallucination.
+function applySearchCitations(html, sources) {
+  if (!sources || !sources.length) return html;
+  // Only replace [N] that are NOT inside an HTML tag (attributes, etc.)
+  // Since renderMarkdown escapes < and >, all [N] in output are real content.
+  return html.replace(/\[(\d+)\]/g, (match, n) => {
+    const idx = parseInt(n, 10) - 1;
+    if (idx >= 0 && idx < sources.length) {
+      const url   = escAttr(sources[idx].url   || '');
+      const title = escAttr(sources[idx].title || sources[idx].url || '');
+      return '<sup class="search-cite" data-url="' + url + '" title="' + title + '">' + n + '</sup>';
+    }
+    // LLM cited a source number that doesn't exist — flag it
+    return '<sup class="search-cite search-cite-low" title="Source index out of range">?</sup>';
+  });
+}
+
+// Extract all inline <src> evidence spans and build a collapsible sources panel
+function buildInlineSrcPanel(msgDiv) {
+  const srcs = msgDiv.querySelectorAll('sup.inline-src[data-ev]');
+  if (!srcs.length) return;
+  const seen = new Set();
+  const evidences = [];
+  srcs.forEach(sup => {
+    const ev = sup.dataset.ev;
+    if (ev && !seen.has(ev)) {
+      seen.add(ev);
+      evidences.push(ev);
+    }
+  });
+  if (!evidences.length) return;
+  
+  const fnWrap = document.createElement('div');
+  fnWrap.className = 'trace-footnotes inline-src-footnotes';
+  const toggle = document.createElement('button');
+  toggle.className = 'trace-fn-toggle';
+  toggle.textContent = 'CITED (' + evidences.length + ')';
+  const body = document.createElement('div');
+  body.className = 'trace-fn-body';
+  body.style.display = 'none';
+  toggle.addEventListener('click', () => {
+    const open = body.style.display !== 'none';
+    body.style.display = open ? 'none' : 'block';
+    toggle.classList.toggle('open', !open);
+  });
+  evidences.forEach((ev, i) => {
+    const row = document.createElement('div');
+    row.className = 'trace-fn-row';
+    const num = document.createElement('span');
+    num.className = 'trace-fn-num';
+    num.textContent = (i + 1) + '.';
+    const evid = document.createElement('span');
+    evid.className = 'inline-src-text';
+    evid.textContent = ev.length > 120 ? ev.slice(0, 117) + '…' : ev;
+    evid.title = ev;
+    row.appendChild(num);
+    row.appendChild(evid);
+    body.appendChild(row);
+  });
+  fnWrap.appendChild(body);
+  const actionRow = getAssistantActionRow(msgDiv);
+  actionRow.appendChild(toggle);
+  msgDiv.appendChild(fnWrap);
+}
+
+// Rebuild the collapsible SOURCES panel for a saved web-search message.
+function restoreSearchSourcesPanel(msgDiv, sources) {
+  if (!sources || !sources.length) return;
+  if (msgDiv.querySelector('.trace-footnotes')) return; // already present
+  const fnWrap = document.createElement('div');
+  fnWrap.className = 'trace-footnotes';
+  const toggle = document.createElement('button');
+  toggle.className = 'trace-fn-toggle';
+  toggle.textContent = 'SOURCES (' + sources.length + ')';
+  const body = document.createElement('div');
+  body.className = 'trace-fn-body';
+  body.style.display = 'none';
+  toggle.addEventListener('click', () => {
+    const open = body.style.display !== 'none';
+    body.style.display = open ? 'none' : 'block';
+    toggle.classList.toggle('open', !open);
+  });
+  sources.forEach((src, i) => {
+    const row = document.createElement('div');
+    row.className = 'trace-fn-row';
+    const num = document.createElement('span');
+    num.className = 'trace-fn-num';
+    num.textContent = (i + 1) + '.';
+    const lnk = document.createElement('a');
+    lnk.href = '#';
+    lnk.className = 'search-src-link';
+    lnk.textContent = src.title || src.url;
+    lnk.title = src.url;
+    lnk.addEventListener('click', e => { e.preventDefault(); chrome.tabs.create({ url: src.url }); });
+    row.appendChild(num);
+    row.appendChild(lnk);
+    body.appendChild(row);
+  });
+  fnWrap.appendChild(toggle);
+  fnWrap.appendChild(body);
+  msgDiv.appendChild(fnWrap);
+}
+
 function renderChatMessages(content) {
   LOG('renderChatMessages: content.length=', content.length,
       '| caller=', (new Error().stack.split('\n')[2] || '').trim().slice(0, 80));
@@ -1263,7 +1480,7 @@ function renderChatMessages(content) {
         lastTsKey = k;
       }
     }
-    const msgDiv = appendMsgEl(m.role, m.message, false, m.contextRefs || null);
+    const msgDiv = appendMsgEl(m.role, m.message, false, m.contextRefs || null, { effort: m.effort || S.effort });
     // Restore saved trace annotations instead of showing TRACE button
     if (m.role === 'assistant' && m.traceAttributions && m.traceAttributions.length) {
       const traceBtn = msgDiv.querySelector('.trace-btn');
@@ -1276,13 +1493,19 @@ function renderChatMessages(content) {
       renderTraceAnnotations(msgDiv, m.traceAttributions, savedSrcs);
       attachTraceButton(msgDiv, m.message, savedSrcs, m.traceAttributions);
     }
+    // Restore web search citations + sources panel from history
+    if (m.role === 'assistant' && m.searchSources && m.searchSources.length) {
+      msgDiv._content.innerHTML = applySearchCitations(msgDiv._content.innerHTML, m.searchSources);
+      restoreSearchSourcesPanel(msgDiv, m.searchSources);
+    }
   }
   el.chatMessages.scrollTop = el.chatMessages.scrollHeight;
 }
 
 //  appendMsgEl 
 // role, text, streaming, contextRefs:[{text,context}]|null
-function appendMsgEl(role, text, streaming, contextRefs) {
+function appendMsgEl(role, text, streaming, contextRefs, opts) {
+  opts = opts || {};
   const div = document.createElement('div');
   div.className = 'msg ' + role;
   const span = document.createElement('span');
@@ -1292,25 +1515,168 @@ function appendMsgEl(role, text, streaming, contextRefs) {
   div.appendChild(span);
   div._content = span;
   div._originalText = text || '';
+  div._effort = opts.effort || S.effort;
   if (streaming) div.classList.add('streaming');
 
   if (role === 'assistant' && contextRefs && contextRefs.length) {
     appendCtxFooter(div, contextRefs);
   }
 
-  // Attach trace button to all non-streaming assistant messages
-  if (role === 'assistant' && !streaming && text) {
+  if (role === 'assistant') attachAssistantActionRow(div);
+
+  // Attach trace button to all non-streaming assistant messages except instant answers
+  if (role === 'assistant' && !streaming && text && div._effort !== 'instant') {
     const savedSrcs = (contextRefs || []).map(r => ({
       text: r.text || r.context || '',
       url:  r.url   || '',
       title: r.title || '',
     }));
-    attachTraceButton(div, text, savedSrcs);
+    if (div._effort !== 'instant') attachTraceButton(div, text, savedSrcs);
+  }
+
+  // Collect inline <src> evidence and build sources panel
+  if (role === 'assistant' && !streaming && text) {
+    buildInlineSrcPanel(div);
   }
 
   el.chatMessages.appendChild(div);
   el.chatMessages.scrollTop = el.chatMessages.scrollHeight;
   return div;
+}
+
+function attachAssistantActionRow(msgDiv) {
+  if (msgDiv.querySelector('.msg-action-row')) return;
+  const row = document.createElement('div');
+  row.className = 'msg-action-row';
+  const tryBtn = document.createElement('button');
+  tryBtn.className = 'trace-btn tryhard-pill';
+  tryBtn.textContent = normalizeEffort(msgDiv._effort || S.effort).toUpperCase();
+  tryBtn.title = 'Retry with balanced or deep effort';
+  tryBtn.addEventListener('mouseenter', function() {
+    showTryHardMenu(tryBtn, msgDiv);
+  });
+  tryBtn.addEventListener('click', function(e) {
+    e.stopPropagation();
+    showTryHardMenu(tryBtn, msgDiv);
+  });
+  row.appendChild(tryBtn);
+  msgDiv.appendChild(row);
+
+  const copyBtn = document.createElement('button');
+  copyBtn.className = 'msg-copy-btn';
+  copyBtn.textContent = 'COPY';
+  copyBtn.title = 'Copy answer';
+  copyBtn.addEventListener('click', function(e) {
+    e.stopPropagation();
+    navigator.clipboard.writeText(msgDiv._originalText || msgDiv._content.textContent || '').catch(() => {});
+  });
+  msgDiv.appendChild(copyBtn);
+}
+
+function getAssistantActionRow(msgDiv) {
+  let row = msgDiv.querySelector('.msg-action-row');
+  if (!row) {
+    attachAssistantActionRow(msgDiv);
+    row = msgDiv.querySelector('.msg-action-row');
+  }
+  return row;
+}
+
+function showTryHardMenu(anchor, msgDiv) {
+  removeFloatingMenus();
+  const menu = document.createElement('div');
+  menu.className = 'cwa-pop-menu';
+  ['balanced', 'deep'].forEach(function(effort) {
+    const b = document.createElement('button');
+    b.textContent = effort.toUpperCase();
+    b.addEventListener('click', function(e) {
+      e.stopPropagation();
+      retryAssistantMessage(msgDiv, effort);
+      removeFloatingMenus();
+    });
+    menu.appendChild(b);
+  });
+  positionMenu(menu, anchor);
+}
+
+async function retryAssistantMessage(msgDiv, effort) {
+  const base = msgDiv._retryPayload;
+  if (!base || !msgDiv._userText || S.chatBusy) return;
+  const targetEffort = normalizeEffort(effort);
+  S.effort = targetEffort;
+  chrome.storage.sync.set({ cwaEffort: targetEffort });
+  const pageText = (S.pageHtmlCache[S.currentUrl] && S.pageHtmlCache[S.currentUrl].text) || '';
+  const packet = pageText ? buildContextPacket(pageText, msgDiv._userText, targetEffort, S.currentTitle || S.currentUrl) : null;
+  const payload = Object.assign({}, base, {
+    effort: targetEffort,
+    pageMap: packet ? packet.pageMap : base.pageMap,
+    middleAnchors: packet ? packet.middleAnchors : base.middleAnchors,
+    candidateSpans: packet ? packet.candidateSpans : base.candidateSpans,
+  });
+  const retryDiv = appendMsgEl('assistant', '', true, null);
+  retryDiv._userText = msgDiv._userText;
+  retryDiv._retryPayload = payload;
+  S.chatBusy = true;
+  let buf = '';
+  try {
+    await new Promise((resolve, reject) => {
+      const port = chrome.runtime.connect({ name: 'cwa' });
+      S.currentPort = port;
+      port.onMessage.addListener(msg => {
+        if (msg.type === 'CHUNK') {
+          buf += msg.chunk;
+          retryDiv._content.innerHTML = renderMarkdown(buf);
+          return;
+        }
+        port.disconnect();
+        if (msg.error) { reject(new Error(msg.error)); return; }
+        const reply = msg.reply || buf;
+        retryDiv._content.innerHTML = renderMarkdown(reply);
+        retryDiv._originalText = reply;
+        retryDiv._retryPayload = payload;
+        buildInlineSrcPanel(retryDiv);
+        const retrySources = packet && pageText
+          ? [{ text: pageText, chunks: packet.chunks, url: S.currentUrl, title: S.currentTitle || S.currentUrl }]
+          : [];
+        attachTraceButton(retryDiv, reply, retrySources);
+        persistTryHardResult(msgDiv._userText, reply, targetEffort);
+        resolve();
+      });
+      port.onDisconnect.addListener(() => resolve());
+      port.postMessage({ type: 'QUERY', payload });
+    });
+  } catch(e) {
+    retryDiv.className = 'msg error';
+    retryDiv._content.textContent = 'ERROR: ' + e.message;
+  } finally {
+    retryDiv.classList.remove('streaming');
+    S.chatBusy = false;
+    S.currentPort = null;
+  }
+}
+
+function persistTryHardResult(userText, reply, effort) {
+  const title = S.currentTitle || S.currentUrl;
+  const markedUser = userText + '\n\n[try hard: ' + effort + ']';
+  if (S.currentEntry) {
+    if (!S.currentEntry.content) S.currentEntry.content = [];
+    S.currentEntry.content.push(
+      { timestamp: Date.now(), role: 'user', message: markedUser, context: '' },
+      { timestamp: Date.now() + 1, role: 'assistant', message: reply, context: '' }
+    );
+  }
+  S.suppressHistoryRender = true;
+  chrome.runtime.sendMessage({
+    type: 'HISTORY_SAVE',
+    payload: {
+      url: S.currentUrl,
+      title,
+      userMessage: markedUser,
+      aiReply: reply,
+      contextTexts: [],
+      contextRefs: [],
+    },
+  }, () => { S.suppressHistoryRender = false; syncToDir().catch(() => {}); });
 }
 
 // ── AUTO_FIND: PAGE SECTIONS panel (mirrors TRACE SOURCES) ─────────────────
@@ -1407,47 +1773,97 @@ function updateDeepChatBtn() {
   const active = !!(S.currentUrl && S.pageHtmlCache[S.currentUrl]);
   document.querySelectorAll('#deep-chat-btn').forEach(btn => {
     btn.classList.toggle('active', active);
-    btn.title = active
-      ? 'Deep Chat ON — full page context + auto-trace (click to release)'
-      : 'Deep Chat — capture full page for context + auto-trace each reply';
+    btn.textContent = S.effort.toUpperCase();
+    btn.title = 'Effort: ' + S.effort + (active ? ' — page context cached' : ' — click to choose retrieval depth');
   });
 }
 
-async function autoRunTrace(msgDiv, reply, sources) {
-  const ind = document.createElement('span');
-  ind.className = 'trace-btn';
-  ind.textContent = 'TRACING…';
-  ind.style.opacity = '0.6';
-  msgDiv.appendChild(ind);
-  el.chatMessages.scrollTop = el.chatMessages.scrollHeight;
-  const activeSources = (sources && sources.length) ? sources : [];
-  const result = await new Promise(resolve =>
-    chrome.runtime.sendMessage({
-      type: 'TRACE',
-      payload: { reply, sources: activeSources, model: S.model },
-    }, resolve)
-  );
-  ind.remove();
-  if (!result || result.error) {
-    attachTraceButton(msgDiv, reply, activeSources);
-    return;
-  }
-  const valid = (result.attributions || []).filter(a =>
-    a && a.claim && a.claim.trim() && a.evidence && a.evidence.trim()
-  );
-  S.suppressHistoryRender = true;
-  chrome.tabs.query({ active: true, currentWindow: true }, tabs => {
-    const url = (tabs && tabs[0] && tabs[0].url) || S.currentUrl || '';
-    chrome.runtime.sendMessage({
-      type: 'TRACE_SAVE',
-      payload: { url, aiReply: reply, traceAttributions: valid },
-    }, () => { S.suppressHistoryRender = false; syncToDir().catch(() => {}); });
+function syncEffortButtons() {
+  updateDeepChatBtn();
+}
+
+function removeFloatingMenus() {
+  document.querySelectorAll('.cwa-pop-menu').forEach(m => m.remove());
+}
+
+function showEffortMenu(anchor) {
+  removeFloatingMenus();
+  const menu = document.createElement('div');
+  menu.className = 'cwa-pop-menu';
+  EFFORTS.forEach(function(effort) {
+    const b = document.createElement('button');
+    b.textContent = effort.toUpperCase();
+    b.className = effort === S.effort ? 'active' : '';
+    b.title = effort === 'instant' ? 'Fast local-first mode with no trace entry'
+      : effort === 'balanced' ? 'More evidence and middle-page coverage'
+      : 'Largest retrieval budget for try-hard runs';
+    b.addEventListener('click', function(ev) {
+      ev.stopPropagation();
+      S.effort = effort;
+      chrome.storage.sync.set({ cwaEffort: effort });
+      if (effort !== 'instant' && !S.pageHtmlCache[S.currentUrl]) autoCapturePageCtx().catch(() => {});
+      if (effort === 'instant' && S.pageHtmlCache[S.currentUrl]) delete S.pageHtmlCache[S.currentUrl];
+      syncEffortButtons();
+      removeFloatingMenus();
+    });
+    menu.appendChild(b);
   });
-  renderTraceAnnotations(msgDiv, valid, activeSources);
-  attachTraceButton(msgDiv, reply, activeSources, valid);
+  positionMenu(menu, anchor);
+}
+
+function showModelMenu(e) {
+  if (e && e.preventDefault) e.preventDefault();
+  const anchor = e && e.currentTarget ? e.currentTarget : el.modelBadge;
+  removeFloatingMenus();
+  const menu = document.createElement('div');
+  menu.className = 'cwa-pop-menu model-menu';
+  cwaListProviders().forEach(function(provider) {
+    const cfg = cwaGetProviderConfig(provider);
+    const label = document.createElement('div');
+    label.className = 'menu-label';
+    label.textContent = cfg.label;
+    menu.appendChild(label);
+    cfg.models.forEach(function(model) {
+      const b = document.createElement('button');
+      const hasKey = !!(S.apiKeys && S.apiKeys[provider]);
+      b.textContent = model + (provider === 'deepseek' && model === 'deepseek-chat' ? ' (legacy)' : '');
+      b.className = provider === S.provider && model === S.model ? 'active' : '';
+      if (!hasKey) {
+        b.disabled = true;
+        b.title = 'API key needed';
+      }
+      b.addEventListener('click', function(ev) {
+        ev.stopPropagation();
+        if (!hasKey) return;
+        S.provider = provider;
+        S.model = model;
+        chrome.storage.sync.set({ cwaProvider: provider, cwaModel: model });
+        syncModelBadges();
+        removeFloatingMenus();
+      });
+      menu.appendChild(b);
+    });
+  });
+  positionMenu(menu, anchor);
+}
+
+function positionMenu(menu, anchor) {
+  document.body.appendChild(menu);
+  const r = anchor.getBoundingClientRect();
+  const mw = menu.offsetWidth || 180;
+  const mh = menu.offsetHeight || 160;
+  menu.style.left = Math.max(4, Math.min(window.innerWidth - mw - 4, r.right - mw)) + 'px';
+  menu.style.top = Math.max(4, Math.min(window.innerHeight - mh - 4, r.top - mh - 6)) + 'px';
+  menu.addEventListener('mouseleave', function() {
+    removeFloatingMenus();
+  });
+  setTimeout(function() {
+    document.addEventListener('click', removeFloatingMenus, { once: true });
+  }, 0);
 }
 
 function attachTraceButton(msgDiv, reply, sources, priorAttributions) {
+  if (msgDiv._effort === 'instant') return;
   const isRetrace = !!(priorAttributions && priorAttributions.length);
   const btn = document.createElement('button');
   btn.className = 'trace-btn';
@@ -1463,7 +1879,7 @@ function attachTraceButton(msgDiv, reply, sources, priorAttributions) {
     let activeSources = (sources && sources.length) ? sources : [];
     if (!activeSources.length && S.pageHtmlCache[S.currentUrl]) {
       const cached = S.pageHtmlCache[S.currentUrl];
-      activeSources = [{ text: cached.text, url: S.currentUrl, title: cached.title || S.currentUrl }];
+      activeSources = [{ text: cached.text, chunks: buildLocalChunks(cached.text, cached.title || S.currentUrl), url: S.currentUrl, title: cached.title || S.currentUrl }];
     }
     if (!activeSources.length) {
       btn.textContent = 'NO SRC';
@@ -1474,7 +1890,7 @@ function attachTraceButton(msgDiv, reply, sources, priorAttributions) {
     const result = await new Promise(resolve =>
       chrome.runtime.sendMessage({
         type: 'TRACE',
-        payload: { reply, sources: activeSources, model: currentModel, priorAttributions: priorAttributions || null },
+        payload: { reply, sources: activeSources, model: currentModel, effort: S.effort, priorAttributions: priorAttributions || null },
       }, resolve)
     );
     if (!result || result.error) {
@@ -1486,7 +1902,7 @@ function attachTraceButton(msgDiv, reply, sources, priorAttributions) {
     btn.remove();
     // Filter out attributions with empty claim or evidence before rendering
     const valid = (result.attributions || []).filter(a =>
-      a && a.claim && a.claim.trim() && a.evidence && a.evidence.trim()
+      a && a.claim && a.claim.trim() && a.evidence && a.evidence.trim() && a.status !== 'unverified'
     );
     // Clear previous trace annotations when re-tracing
     if (isRetrace) clearMsgTraceAnnotations(msgDiv);
@@ -1505,7 +1921,7 @@ function attachTraceButton(msgDiv, reply, sources, priorAttributions) {
     renderTraceAnnotations(msgDiv, valid, activeSources);
     attachTraceButton(msgDiv, reply, sources, valid);  // re-attach as RE-TRACE
   });
-  msgDiv.appendChild(btn);
+  getAssistantActionRow(msgDiv).appendChild(btn);
 }
 
 function clearMsgTraceAnnotations(msgDiv) {
@@ -1520,7 +1936,7 @@ function clearMsgTraceAnnotations(msgDiv) {
 function renderTraceAnnotations(msgDiv, attributions, sources) {
   // Filter out any empty entries that slipped through
   const valid = (attributions || []).filter(a =>
-    a && a.claim && a.claim.trim() && a.evidence && a.evidence.trim()
+    a && a.claim && a.claim.trim() && a.evidence && a.evidence.trim() && a.status !== 'unverified'
   );
   if (!valid.length) {
     const note = document.createElement('div');
@@ -1749,7 +2165,7 @@ async function runSearchFlow(text, dedupedSels, pageCtxText, resumeSummary, page
         port.disconnect();
         if (msg.error) { reject(new Error(msg.error)); return; }
         const reply = msg.reply || buf;
-        aiDiv._content.innerHTML = renderMarkdown(reply);
+        aiDiv._content.innerHTML = applySearchCitations(renderMarkdown(reply), rawResults);
         aiDiv.classList.remove('streaming');
         // Minimal search marker at top of message
         const marker = document.createElement('div');
@@ -1801,7 +2217,7 @@ async function runSearchFlow(text, dedupedSels, pageCtxText, resumeSummary, page
         const now = Date.now();
         const newMsgPair = [
           { timestamp: now, role: 'user', message: text, context: snapshotSels.map(s => s.text).filter(Boolean).join(' | ') },
-          { timestamp: now + 1, role: 'assistant', message: markedReply, context: '', contextRefs: traceSrcs.map((ts, i) => ({ id: snapshotSels[i] ? snapshotSels[i].id : undefined, text: snapshotSels[i] ? snapshotSels[i].text : ts.text, context: snapshotSels[i] ? snapshotSels[i].context : ts.text, url: ts.url, title: ts.title })) },
+          { timestamp: now + 1, role: 'assistant', message: markedReply, context: '', contextRefs: traceSrcs.map((ts, i) => ({ id: snapshotSels[i] ? snapshotSels[i].id : undefined, text: snapshotSels[i] ? snapshotSels[i].text : ts.text, context: snapshotSels[i] ? snapshotSels[i].context : ts.text, url: ts.url, title: ts.title })), searchSources: rawResults },
         ];
         if (S.currentEntry) {
           if (!S.currentEntry.content) S.currentEntry.content = [];
@@ -1822,6 +2238,7 @@ async function runSearchFlow(text, dedupedSels, pageCtxText, resumeSummary, page
               context: snapshotSels[i] ? snapshotSels[i].context : ts.text,
               url: ts.url, title: ts.title,
             })),
+            searchSources: rawResults,
           },
         }, () => { S.suppressHistoryRender = false; syncToDir().catch(() => {}); });
         resolve();
@@ -1929,6 +2346,136 @@ function backToList() {
   showListView();
 }
 
+function normText(s) {
+  return (s || '').replace(/\s+/g, ' ').trim();
+}
+
+function textHash(text) {
+  let h = 2166136261;
+  const s = String(text || '');
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h += (h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24);
+  }
+  return (h >>> 0).toString(36);
+}
+
+function tokenizeLocal(text) {
+  const lower = String(text || '').toLowerCase();
+  const tokens = lower.match(/\w+/g) || [];
+  const cjkRe = /[\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff\u3040-\u30ff\uac00-\ud7af]/g;
+  let m;
+  while ((m = cjkRe.exec(lower)) !== null) {
+    tokens.push(m[0]);
+    const next = lower[m.index + 1];
+    if (next && /[\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff\u3040-\u30ff\uac00-\ud7af]/.test(next)) tokens.push(m[0] + next);
+  }
+  return tokens;
+}
+
+function buildLocalChunks(text, title) {
+  const clean = normText(text);
+  if (!clean) return [];
+  const chunks = [];
+  const size = 900, overlap = 140;
+  for (let start = 0; start < clean.length; start += size - overlap) {
+    const part = clean.slice(start, start + size).trim();
+    if (part.length < 40) continue;
+    const idx = chunks.length;
+    chunks.push({
+      idx,
+      textFull: part,
+      textPreview: part.slice(0, 650),
+      text: part.slice(0, 650),
+      headingPath: title || 'Page',
+      positionRatio: clean.length ? start / clean.length : 0,
+      tagName: 'text',
+      prevIdx: idx > 0 ? idx - 1 : null,
+      nextIdx: null,
+      hash: textHash(part),
+    });
+    if (idx > 0) chunks[idx - 1].nextIdx = idx;
+  }
+  return chunks;
+}
+
+function selectLocalChunks(chunks, query, charBudget) {
+  const qTokens = tokenizeLocal(query);
+  const exact = normText(query).toLowerCase();
+  const scored = chunks.map(function(c) {
+    const text = (c.textFull || c.text || '').toLowerCase();
+    const heading = (c.headingPath || '').toLowerCase();
+    let score = 0;
+    qTokens.forEach(function(t) {
+      if (t.length < 2) return;
+      if (text.indexOf(t) !== -1) score += 2;
+      if (heading.indexOf(t) !== -1) score += 3;
+    });
+    if (exact && text.indexOf(exact) !== -1) score += 8;
+    return { idx: c.idx, score };
+  }).sort(function(a, b) { return b.score - a.score; });
+  const selected = new Set();
+  let chars = 0;
+  scored.forEach(function(s) {
+    if (s.score <= 0 || chars >= charBudget) return;
+    selected.add(s.idx);
+    chars += (chunks[s.idx].text || '').length;
+  });
+  [0.15, 0.35, 0.5, 0.65, 0.85].forEach(function(r) {
+    if (chars >= charBudget) return;
+    const idx = Math.min(chunks.length - 1, Math.floor(chunks.length * r));
+    if (idx >= 0 && chunks[idx] && !selected.has(idx)) {
+      selected.add(idx);
+      chars += (chunks[idx].text || '').length;
+    }
+  });
+  return Array.from(selected).sort(function(a, b) { return a - b; });
+}
+
+function splitEvidenceSegments(text) {
+  const parts = normText(text).match(/[^.!?。！？]+[.!?。！？]?/g) || [normText(text)];
+  return parts.map(s => s.trim()).filter(s => s.length >= 30);
+}
+
+function buildContextPacket(pageText, question, effort, title) {
+  const safeEffort = normalizeEffort(effort);
+  const budget = EFFORT_BUDGETS[safeEffort] || EFFORT_BUDGETS.instant;
+  const chunks = buildLocalChunks(pageText, title);
+  const idxs = selectLocalChunks(chunks, question, budget.evidenceChars);
+  const candidateSpans = [];
+  let chars = 0;
+  idxs.forEach(function(idx) {
+    const c = chunks[idx];
+    if (!c || chars >= budget.evidenceChars) return;
+    splitEvidenceSegments(c.textFull || c.text).slice(0, 2).forEach(function(seg) {
+      if (chars >= budget.evidenceChars) return;
+      const evidence = seg.slice(0, 260);
+      candidateSpans.push({
+        spanId: 's' + candidateSpans.length,
+        chunkIdx: c.idx,
+        evidence,
+        headingPath: c.headingPath,
+        positionRatio: c.positionRatio,
+        score: 0.65,
+      });
+      chars += evidence.length;
+    });
+  });
+  const pageMap = chunks.filter(function(c, i) { return i === 0 || i % Math.max(1, Math.floor(chunks.length / 8)) === 0; })
+    .slice(0, 10)
+    .map(function(c) { return '[' + Math.round(c.positionRatio * 100) + '%] ' + c.headingPath; })
+    .join('\n');
+  const middleAnchors = [];
+  const start = Math.floor(chunks.length * 0.28);
+  const end = Math.max(start + 1, Math.floor(chunks.length * 0.78));
+  const span = Math.max(1, end - start);
+  for (let i = 0; i < budget.middleAnchors; i++) {
+    const c = chunks[Math.min(chunks.length - 1, start + Math.floor(span * (i + 0.5) / budget.middleAnchors))];
+    if (c) middleAnchors.push('[' + Math.round(c.positionRatio * 100) + '%] ' + c.headingPath + ' | ' + normText(c.textFull).slice(0, 240));
+  }
+  return { chunks, candidateSpans, pageMap, middleAnchors: middleAnchors.join('\n') };
+}
+
 //  Chat send 
 async function sendChatMessage() {
   const rawText = el.chatInp.value.trim();
@@ -1949,6 +2496,9 @@ async function sendChatMessage() {
   // Phase 0-A: full page text — sent only when cached via deep mode (cache-optimized path only)
   const pageCtxCache = S.pageHtmlCache[S.currentUrl] || null;
   const pageCtxText = pageCtxCache ? pageCtxCache.text : null;
+  const contextPacket = pageCtxText
+    ? buildContextPacket(pageCtxText, text, S.effort, S.currentTitle || S.currentUrl)
+    : buildContextPacket(allSels.map(s => s.context || s.text).join('\n\n'), text, S.effort, S.currentTitle || S.currentUrl);
 
   // Deduplicate: if a selection is identical to the cached page text it's redundant (already in system)
   let dedupedSels = pageCtxText
@@ -2000,8 +2550,12 @@ async function sendChatMessage() {
     selections: dedupedSels.map(s => ({ text: s.text, context: s.context || s.text })),
     messages:   histMsgs,
     model:      S.model,
+    effort:     S.effort,
     presetInstruction: presetInstruction || null,
     pageContext: pageCtxText,   // full page text → system-level caching, not repeated in user messages
+    pageMap: contextPacket.pageMap || undefined,
+    middleAnchors: contextPacket.middleAnchors || undefined,
+    candidateSpans: contextPacket.candidateSpans || undefined,
     resumeSummary: resumeSummary || undefined,  // Phase 0-C
     pageDelta: pageDeltaText || undefined,       // Phase 0-B
   };
@@ -2036,6 +2590,8 @@ async function sendChatMessage() {
         const reply = msg.reply || buf;
         aiDiv._content.innerHTML = renderMarkdown(reply);
         aiDiv.classList.remove('streaming');
+        // Build CITED panel from any <src> evidence spans in the final reply
+        buildInlineSrcPanel(aiDiv);
         // Super Ctrl+F: auto-highlight quoted matches returned by /find
         if (presetKey === 'find' && reply) {
           const quotes = [];
@@ -2050,12 +2606,12 @@ async function sendChatMessage() {
         }
         if (snapshotSels.length) appendCtxFooter(aiDiv, snapshotSels);
         aiDiv._originalText = reply;
-        if (pageCtxText) {
-          const deepSrcs = [{ text: pageCtxText, url: S.currentUrl, title: S.currentTitle || S.currentUrl }];
-          autoRunTrace(aiDiv, reply, deepSrcs);
-        } else {
-          attachTraceButton(aiDiv, reply, traceSrcs);
-        }
+        aiDiv._retryPayload = Object.assign({}, payload, { messages: histMsgs });
+        aiDiv._userText = text;
+        const traceSources = pageCtxText
+          ? [{ text: pageCtxText, chunks: contextPacket.chunks, url: S.currentUrl, title: S.currentTitle || S.currentUrl }]
+          : traceSrcs;
+        if (S.effort !== 'instant') attachTraceButton(aiDiv, reply, traceSources);
         el.chatMessages.scrollTop = el.chatMessages.scrollHeight;
         if (snapshotSels.length > 0) S.lastCtxSels = snapshotSels.slice();
         // Update S.currentEntry immediately so subsequent messages use fresh history
@@ -2141,7 +2697,7 @@ function syncModelBadges() {
   const label = cwaFormatModelBadge(S.provider, S.model);
   document.querySelectorAll('.model-badge').forEach(function(b) {
     b.textContent = label;
-    b.title = cwaGetProviderConfig(S.provider).label + ' model: ' + S.model + '. Click to cycle models for this provider.';
+    b.title = cwaGetProviderConfig(S.provider).label + ' model: ' + S.model + '. Click to choose provider/model.';
   });
 }
 
@@ -2162,6 +2718,12 @@ function renderMarkdown(raw) {
     blocks.push('<pre><code>' + esc(code.trim()) + '</code></pre>');
     return '\x00BLOCK' + (blocks.length-1) + '\x00';
   });
+  // Extract <src>…</src> evidence spans before HTML escaping
+  const srcSpans = [];
+  t = t.replace(/<src(?:\s+id=["']?([^"'>\s]+)["']?)?>([\s\S]*?)<\/src>/gi, (_, id, s) => {
+    srcSpans.push(s.trim());
+    return '\x00SRC' + (srcSpans.length - 1) + '\x00';
+  });
   t = t.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
   t = t.replace(/^### (.+)$/gm,'<h3>$1</h3>').replace(/^## (.+)$/gm,'<h2>$1</h2>').replace(/^# (.+)$/gm,'<h1>$1</h1>');
   t = t.replace(/^&gt; (.+)$/gm,'<blockquote>$1</blockquote>');
@@ -2173,6 +2735,13 @@ function renderMarkdown(raw) {
   t = t.replace(/((?:^\d+\. .+\n?)+)/gm, m => '<ol>' + m.trim().split('\n').map(l=>'<li>'+l.replace(/^\d+\. /,'')+'</li>').join('') + '</ol>');
   t = t.split(/\n{2,}/).map(c => { c = c.trim(); if (!c) return ''; if (/^<(h[1-3]|ul|ol|pre|hr|blockquote)/.test(c)) return c; return '<p>'+c.replace(/\n/g,'<br>')+'</p>'; }).join('\n');
   t = t.replace(/\x00BLOCK(\d+)\x00/g, (_, i) => blocks[+i]);
+  // Restore <src> spans as ⁺ superscripts — clickable to highlight on page
+  if (srcSpans.length) {
+    t = t.replace(/\x00SRC(\d+)\x00/g, (_, i) => {
+      const ev = srcSpans[+i];
+      return '<sup class="inline-src" data-ev="' + escAttr(ev) + '" title="' + escAttr(ev) + '">&#x2B;</sup>';
+    });
+  }
   // [SEARCH: query] → pill button that triggers in-panel web search (no external redirect)
   t = t.replace(/\[SEARCH:\s*([^\]]{3,120})\]/gi, (_, q) => {
     const display = q.trim();
