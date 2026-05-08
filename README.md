@@ -1,4 +1,4 @@
-# <img src="icons/pluck.png" alt="Pluck" width="40" valign="middle" /> Pluck — AI Sidebar for Any Web Page
+# <img src="icons/pluck.png" alt="Pluck" width="40" valign="middle" /> Pluck — Privacy-first, source-grounded webpage assistant.
 
 [English](#english) | [中文](#中文)
 
