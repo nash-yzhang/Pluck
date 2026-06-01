@@ -32,20 +32,25 @@
     chrome.runtime.sendMessage({ type: 'OPEN_SIDE_PANEL', goChat: !!goChat, handoff: handoff || null }).catch(() => {});
   }
   function isSidePanelOpen(cb) {
-    try {
-      if (chrome.storage && chrome.storage.session && chrome.storage.session.get) {
-        chrome.storage.session.get('cwaSpOpen', function(d) {
-          if (d && d.cwaSpOpen) { cb(true); return; }
-          chrome.runtime.sendMessage({ type: 'IS_SIDE_PANEL_OPEN' }, function(resp) {
-            cb(!!(resp && resp.open));
-          });
-        });
-        return;
-      }
-    } catch(_) {}
     chrome.runtime.sendMessage({ type: 'IS_SIDE_PANEL_OPEN' }, function(resp) {
       cb(!!(resp && resp.open));
     });
+  }
+  function setSync(values) {
+    try { chrome.runtime.sendMessage({ type: 'SET_SYNC', values }).catch(() => {}); } catch (_) {}
+  }
+  function getSync(keys, cb) {
+    try {
+      chrome.runtime.sendMessage({ type: 'GET_SYNC', keys }, function(resp) {
+        cb(resp || {});
+      });
+    } catch (_) { cb({}); }
+  }
+  function setSession(key, value) {
+    try { chrome.runtime.sendMessage({ type: 'SET_SESSION', key, value }).catch(() => {}); } catch (_) {}
+  }
+  function removeSession(key) {
+    try { chrome.runtime.sendMessage({ type: 'REMOVE_SESSION', key }).catch(() => {}); } catch (_) {}
   }
   function sendSelection(type, captured) {
     chrome.runtime.sendMessage({
@@ -94,11 +99,13 @@
   //   locked  + Esc / close btn  → idle   (clears HL)
   //   locked  + send/handoff     → idle   (clears HL before new locked is set)
 
+  let _pointer = { x: 0, y: 0 };
   const SEL = (function() {
-    const GHOST_CSS   = 'outline:1px solid rgba(77,250,154,0.35)!important;outline-offset:2px!important;cursor:crosshair!important;';
-    const LOCKED_CSS  = 'outline:2px solid #4dfa9a!important;outline-offset:3px!important;box-shadow:0 0 0 4px rgba(77,250,154,0.10)!important;';
-    const TEXT_HL_CSS = 'background:rgba(77,250,154,0.18)!important;color:inherit!important;' +
-                        'text-decoration:underline!important;text-decoration-color:#4dfa9a!important;' +
+    const GHOST_CSS   = 'outline:3px solid rgba(77,250,154,0.92)!important;outline-offset:3px!important;cursor:crosshair!important;' +
+                        'box-shadow:0 0 0 5px rgba(77,250,154,0.18)!important;';
+    const LOCKED_CSS  = 'outline:3px solid #4dfa9a!important;outline-offset:4px!important;box-shadow:0 0 0 7px rgba(77,250,154,0.20)!important;';
+    const TEXT_HL_CSS = 'background:rgba(77,250,154,0.26)!important;color:inherit!important;' +
+                        'text-decoration:underline 2px!important;text-decoration-color:#4dfa9a!important;' +
                         'text-underline-offset:3px!important;outline:none!important;border-radius:2px!important;';
     let _state    = 'idle';
     let _hover    = null;   // ghosted element
@@ -106,6 +113,7 @@
     let _lockPrev = '';     // its original style
     let _marks    = [];     // locked text <mark> nodes
     let _selStyle = null;   // <style> for drag ::selection color
+    const _childMemory = new WeakMap();
 
     function _applyEl(el, css) {
       if (!el || el === document.documentElement || el === document.body) return;
@@ -140,6 +148,7 @@
 
     return {
       get state() { return _state; },
+      get target() { return _hover; },
 
       // Enter picking mode (Alt+1 from idle, or Alt+1 from locked to restart)
       startPicking() {
@@ -170,6 +179,33 @@
       },
       unhover(el) {
         if (_hover === el) _clearHover();
+      },
+
+      nudgeTarget(direction) {
+        if (_state !== 'picking' || !_hover) return false;
+        let next = null;
+        if (direction < 0) {
+          next = _hover.parentElement;
+          if (next === document.documentElement || next === document.body) next = null;
+          if (next) _childMemory.set(next, _hover);
+        } else {
+          const children = Array.from(_hover.children || []).filter(function(el) {
+            const r = el.getBoundingClientRect();
+            const text = (el.innerText || el.textContent || '').trim();
+            return r.width >= 4 && r.height >= 4 && text;
+          });
+          const remembered = _childMemory.get(_hover);
+          if (remembered && remembered.parentElement === _hover && remembered.isConnected) {
+            next = remembered;
+          } else {
+            let pointed = document.elementFromPoint(_pointer.x || 0, _pointer.y || 0);
+            while (pointed && pointed.parentElement !== _hover) pointed = pointed.parentElement;
+            next = children.indexOf(pointed) !== -1 ? pointed : children[0] || null;
+          }
+        }
+        if (!next) return false;
+        this.hover(next);
+        return true;
       },
 
       // Signal mousedown during drag — turn on green ::selection color
@@ -220,12 +256,38 @@
     };
   })();
 
+  const COPY_GHOST_CSS = 'outline:2px dashed rgba(77,250,154,0.95)!important;outline-offset:3px!important;cursor:copy!important;' +
+                         'box-shadow:0 0 0 4px rgba(77,250,154,0.14)!important;';
+  let _copyHover = null;
+
+  function applyCopyHover(el) {
+    if (!S.copyMode || !el || el === document.documentElement || el === document.body) return;
+    if (_copyHover === el) return;
+    clearCopyHover();
+    _copyHover = el;
+    if (el.__cwa_copy_orig__ === undefined) el.__cwa_copy_orig__ = el.style.cssText;
+    el.style.cssText = (el.__cwa_copy_orig__ || '') + ';' + COPY_GHOST_CSS;
+  }
+
+  function clearCopyHover(el) {
+    if (el && _copyHover !== el) return;
+    if (!_copyHover) return;
+    if (_copyHover.__cwa_copy_orig__ !== undefined) {
+      _copyHover.style.cssText = _copyHover.__cwa_copy_orig__ || '';
+      delete _copyHover.__cwa_copy_orig__;
+    }
+    _copyHover = null;
+  }
+
   // ── Mouse event handlers (visual pick mode) ─────────────────────────────
   document.addEventListener('mouseover', function(e) {
+    if (S.copyMode) { applyCopyHover(e.target); return; }
     if (SEL.state !== 'picking') return;
+    _pointer = { x: e.clientX, y: e.clientY };
     SEL.hover(e.target);
   }, true);
   document.addEventListener('mouseout', function(e) {
+    if (S.copyMode) { clearCopyHover(e.target); return; }
     if (SEL.state !== 'picking') return;
     SEL.unhover(e.target);
   }, true);
@@ -233,13 +295,14 @@
   let _click = { x: 0, y: 0, moved: false, el: null };
   document.addEventListener('mousedown', function(e) {
     if (SEL.state === 'picking') {
-      _click = { x: e.clientX, y: e.clientY, moved: false, el: e.target };
+      _click = { x: e.clientX, y: e.clientY, moved: false, el: SEL.target || e.target };
       SEL.dragStart();
       return;
     }
-    if (S.copyMode) { _click = { x: e.clientX, y: e.clientY, moved: false, el: e.target }; }
+    if (S.copyMode) { _click = { x: e.clientX, y: e.clientY, moved: false, el: _copyHover || e.target }; }
   }, true);
   document.addEventListener('mousemove', function(e) {
+    _pointer = { x: e.clientX, y: e.clientY };
     if (!_click.el) return;
     if (Math.hypot(e.clientX - _click.x, e.clientY - _click.y) > 3) _click.moved = true;
   }, true);
@@ -256,6 +319,7 @@
       if (text) {
         navigator.clipboard.writeText(text + '\n\n[Source: ' + location.href + ']').catch(() => {});
         showSelToast('Copied with URL', false);
+        if (selObj && selObj.removeAllRanges) selObj.removeAllRanges();
       }
       _click = {};
       exitCopyMode();
@@ -333,6 +397,7 @@
 
   function exitCopyMode() {
     S.copyMode = false;
+    clearCopyHover();
     document.documentElement.style.cursor = '';
   }
   // exitVisualMode kept as thin alias for compatibility (message handler, etc.)
@@ -373,10 +438,22 @@
       e.preventDefault();
       if (location.href.includes('chrome-extension://mhjfbmdgcfjbbpaeojofohoefgiehjai')) return;
       if (S.copyMode) { exitCopyMode(); return; }
+      SEL.reset();
       const txt = window.getSelection() && window.getSelection().toString().trim();
-      if (txt) { navigator.clipboard.writeText(txt).catch(() => {}); return; }
+      if (txt) {
+        navigator.clipboard.writeText(txt + '\n\n[Source: ' + location.href + ']').catch(() => {});
+        showSelToast('Copied with URL', false);
+        try { window.getSelection().removeAllRanges(); } catch (_) {}
+        return;
+      }
       S.copyMode = true;
       document.documentElement.style.cursor = 'crosshair';
+      return;
+    }
+
+    if (!e.altKey && !e.ctrlKey && !e.shiftKey && SEL.state === 'picking' &&
+        (e.code === 'BracketLeft' || e.code === 'BracketRight')) {
+      if (SEL.nudgeTarget(e.code === 'BracketLeft' ? -1 : 1)) e.preventDefault();
       return;
     }
 
@@ -393,7 +470,8 @@
     if (msg.type === 'TOGGLE_FIND_PANEL') {
       if (_find.visible) { hideFindPanel(); } else { showFindPanel(); }
     }
-    if (msg.type === 'FIND_CHUNK') { _applyFindChunk(msg.chunkIdx, msg.score, msg.searchId); }
+    if (msg.type === 'FIND_DEBUG') { appendFindDebug(msg); }
+    if (msg.type === 'FIND_CHUNK') { _applyFindChunk(msg.chunkIdx, msg.score, msg.searchId, msg.evidence || ''); }
     if (msg.type === 'FIND_DONE')  { _finalizeFindSearch(msg.searchId); }
     // AUTO_FIND: sidebar Q&A → BM25-only chunk highlights + sidebar badge navigation (zero LLM cost)
     // No find panel; scroll saved before first hit and restored on next Q&A / sidebar close / Alt+S.
@@ -507,6 +585,7 @@
     visible: false, panel: null, inp: null, counter: null,
     slider: null, statusEl: null, modeLabel: null, _debounce: null,
     searchId: 0, pos: null, lastQuery: '', minScore: 1,
+    aiNavSearchId: -1,
     effort: 'instant',
     suppressAutoNav: false,  // true for AUTO_FIND from sidebar (no jarring scroll)
   };
@@ -660,7 +739,7 @@
 
     const hardBtn = document.createElement('button');
     hardBtn.textContent = _find.effort.toUpperCase();
-    hardBtn.title = 'Rerun this search with a larger retrieval budget';
+    hardBtn.title = 'Choose find mode';
     hardBtn.style.cssText = 'align-self:flex-start;background:none;border:1px solid #2a2a38;border-radius:3px;color:#9090a0;font:9px monospace;letter-spacing:1px;padding:2px 6px;cursor:pointer;margin-top:2px;';
     hardBtn.addEventListener('mouseenter', () => { hardBtn.style.borderColor = '#4dfa9a'; hardBtn.style.color = '#4dfa9a'; });
     hardBtn.addEventListener('mouseleave', () => { hardBtn.style.borderColor = '#2a2a38'; hardBtn.style.color = '#9090a0'; });
@@ -687,7 +766,19 @@
     });
 
     inp.addEventListener('keydown', e => {
-      if (e.key === 'Enter') { e.preventDefault(); e.shiftKey ? navigateFindMatch(-1) : navigateFindMatch(1); return; }
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        const q = inp.value.trim();
+        if (q && (_find._debounce || q !== _find.lastQuery)) {
+          clearTimeout(_find._debounce);
+          _find._debounce = null;
+          _find.lastQuery = q;
+          doFind(q);
+          return;
+        }
+        e.shiftKey ? navigateFindMatch(-1) : navigateFindMatch(1);
+        return;
+      }
       if (e.key === 'Escape') { e.preventDefault(); hideFindPanel(); return; }
     });
     inp.addEventListener('input', () => {
@@ -695,7 +786,11 @@
       const q = inp.value.trim();
       if (!q) { clearFindHighlights(); _find.lastQuery = ''; counter.textContent = ''; statusEl.textContent = ''; return; }
       statusEl.textContent = '\u23f3\u00a0typing\u2026';
-      _find._debounce = setTimeout(() => { _find.lastQuery = q; doFind(q); }, 800);
+      _find._debounce = setTimeout(() => {
+        _find._debounce = null;
+        _find.lastQuery = q;
+        doFind(q);
+      }, 300);
     });
 
     panel.append(dragHandle, row1, row2, statusEl, hardBtn);
@@ -704,6 +799,14 @@
     // Phase 1-C: reveal slider row on hover
     panel.addEventListener('mouseenter', () => { row2.style.maxHeight = '32px'; row2.style.padding = '4px 2px'; row2.style.overflow = 'visible'; row2.style.opacity = '1'; row2.style.pointerEvents = 'auto'; });
     panel.addEventListener('mouseleave', () => { row2.style.maxHeight = '0'; row2.style.padding = '0 2px'; row2.style.overflow = 'hidden'; row2.style.opacity = '0'; row2.style.pointerEvents = 'none'; });
+  }
+
+  function appendFindDebug(info) {
+    if (!info) return;
+    try {
+      const stale = info.searchId !== _find.searchId ? ' stale current=#' + _find.searchId : '';
+      console.log('[CWA-FIND]', '#' + info.searchId + stale, info.stage || 'debug', info.data || info);
+    } catch (_) {}
   }
 
   function showFindPanel() {
@@ -760,13 +863,14 @@
 
   function doFind(query) {
     _find.searchId++;
+    appendFindDebug({ searchId: _find.searchId, stage: 'start', data: { query, effort: _find.effort } });
     clearFindHighlights();
     if (!query) return;
-    // Phase 1-C: always search broadest; slider filters displayed results client-side
+    // Search semantically for page fields/snippets related to the query.
     _doLiteralHighlight(query, 4);
 
     if (_findHighlights.length) { updateFindCounter(); navigateFindMatchAbsolute(0); }
-    _doFindAI(query, 4, _find.searchId);
+    _doFindAI(query, 2, _find.searchId);
   }
 
   function _doLiteralHighlight(query, score) {
@@ -818,8 +922,11 @@
   // Phase 1: Build DOM chunk array — text for BM25/LLM retrieval, el for direct DOM highlighting
   function _chunkPage(url) {
     if (_pageChunkCache[url]) return _pageChunkCache[url];
-    const els = document.querySelectorAll('p,h1,h2,h3,h4,h5,h6,li,blockquote,td,th,figcaption,caption');
+    const els = Array.from(document.querySelectorAll(
+      'p,h1,h2,h3,h4,h5,h6,li,blockquote,td,th,figcaption,caption,[role=heading],a,button,span,div'
+    ));
     const chunks = [];
+    const seenTextNear = new Set();
     let currentHeading = '';
     for (let i = 0; i < els.length; i++) {
       const el = els[i];
@@ -828,8 +935,22 @@
       if (inPanel) continue;
       if (_isNoisyAncestor(el)) continue;
       const text = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
-      if (text.length < 20) continue;
       const tagName = (el.tagName || '').toLowerCase();
+      const role = el.getAttribute('role') || '';
+      const rect = el.getBoundingClientRect();
+      if (rect.width < 2 || rect.height < 2) continue;
+      const cs = window.getComputedStyle(el);
+      if (cs.display === 'none' || cs.visibility === 'hidden') continue;
+      const fontSize = parseFloat(cs.fontSize || '0') || 0;
+      const isHeadingLike = /^h[1-6]$/.test(tagName) || role === 'heading' || fontSize >= 18;
+      const cls = (el.className && typeof el.className === 'string') ? el.className : '';
+      const isShortVisibleLabel = text.length >= 2 && text.length <= 80 &&
+        (isHeadingLike || tagName === 'button' || tagName === 'a' || /brand|logo|company|employer|organization|org/i.test(cls + ' ' + (el.id || '')));
+      const isBodyChunk = text.length >= 20 && ['p','li','blockquote','td','th','figcaption','caption'].indexOf(tagName) !== -1;
+      if (!isBodyChunk && !isShortVisibleLabel) continue;
+      const key = text.toLowerCase() + '@' + Math.round(rect.top / 10);
+      if (seenTextNear.has(key)) continue;
+      seenTextNear.add(key);
       if (/^h[1-6]$/.test(tagName)) currentHeading = text.slice(0, 120);
       const idx = chunks.length;
       const positionRatio = els.length ? i / els.length : 0;
@@ -853,8 +974,14 @@
   }
 
   function _doFindAI(query, mode, searchId, bm25Only) {
-    if (_find.statusEl) _find.statusEl.textContent = '\u23f3\u00a0AI searching (' + _find.effort + ')\u2026';
-    if (!_findHighlights.length && _find.counter) _find.counter.textContent = 'AI\u2026';
+    const localFirst = _find.effort === 'instant' && !bm25Only;
+    const localOnly = !!bm25Only;
+    if (_find.statusEl) {
+      _find.statusEl.textContent = localOnly
+        ? '\u23f3\u00a0local searching\u2026'
+        : (localFirst ? '\u23f3\u00a0local first, optimizing\u2026' : '\u23f3\u00a0AI searching (' + _find.effort + ')\u2026');
+    }
+    if (!_findHighlights.length && _find.counter) _find.counter.textContent = localOnly || localFirst ? 'local\u2026' : 'AI\u2026';
 
     const url = location.href;
     // Phase 0-B / Phase 1: on SPA delta invalidate both caches so new content is chunked fresh
@@ -874,7 +1001,7 @@
     }
 
     chrome.runtime.sendMessage(
-      { type: 'FIND_ON_PAGE', payload: { query, chunks: chunks.map(function(c) { return { idx: c.idx, text: c.text, headingPath: c.headingPath, positionRatio: c.positionRatio, textPreview: c.textPreview }; }), mode, searchId, bm25Only: !!bm25Only, effort: bm25Only ? 'instant' : _find.effort } },
+      { type: 'FIND_ON_PAGE', payload: { query, chunks: chunks.map(function(c) { return { idx: c.idx, text: c.text, headingPath: c.headingPath, positionRatio: c.positionRatio, textPreview: c.textPreview, tagName: c.tagName }; }), mode, searchId, bm25Only: localOnly, localFirst: localFirst, effort: _find.effort } },
       function(resp) { if (chrome.runtime.lastError) ERR('FIND_ON_PAGE send:', chrome.runtime.lastError.message); }
     );
   }
@@ -937,8 +1064,89 @@
     return true;
   }
 
+  function _tryElementTextHL(root, evidence, score, color) {
+    if (!root || !evidence) return null;
+    const needle = evidence.toLowerCase();
+    const w = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+      acceptNode: function(node) {
+        const p = node.parentElement;
+        if (!p) return NodeFilter.FILTER_REJECT;
+        const t = (p.tagName || '').toLowerCase();
+        if (['script','style','noscript'].indexOf(t) !== -1) return NodeFilter.FILTER_REJECT;
+        if (p.classList && p.classList.contains('cwa-find-hl')) return NodeFilter.FILTER_REJECT;
+        return NodeFilter.FILTER_ACCEPT;
+      }
+    });
+    let tn;
+    while ((tn = w.nextNode())) {
+      const idx = (tn.nodeValue || '').toLowerCase().indexOf(needle);
+      if (idx === -1) continue;
+      try {
+        tn.splitText(idx + evidence.length);
+        const mn = tn.splitText(idx);
+        const mark = document.createElement('mark');
+        mark.className = 'cwa-find-hl';
+        mark.dataset.score = String(score);
+        mark.style.cssText = 'background:' + color.bg + ';color:' + color.fg + ';border-radius:2px;';
+        mn.parentNode.replaceChild(mark, mn);
+        mark.appendChild(mn);
+        return mark;
+      } catch (_) {}
+    }
+    const mapped = [];
+    const nodes = [];
+    const w2 = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+      acceptNode: function(node) {
+        const p = node.parentElement;
+        if (!p) return NodeFilter.FILTER_REJECT;
+        const t = (p.tagName || '').toLowerCase();
+        if (['script','style','noscript'].indexOf(t) !== -1) return NodeFilter.FILTER_REJECT;
+        if (p.classList && p.classList.contains('cwa-find-hl')) return NodeFilter.FILTER_REJECT;
+        return NodeFilter.FILTER_ACCEPT;
+      }
+    });
+    let normalized = '';
+    while ((tn = w2.nextNode())) nodes.push(tn);
+    nodes.forEach(function(node) {
+      const text = node.nodeValue || '';
+      for (let i = 0; i < text.length; i++) {
+        const ch = text[i];
+        if (/\s/.test(ch)) {
+          if (normalized && normalized[normalized.length - 1] !== ' ') {
+            normalized += ' ';
+            mapped.push({ node, offset: i });
+          }
+        } else {
+          normalized += ch.toLowerCase();
+          mapped.push({ node, offset: i });
+        }
+      }
+    });
+    const normNeedle = evidence.replace(/\s+/g, ' ').trim().toLowerCase();
+    const start = normalized.indexOf(normNeedle);
+    if (start === -1 || !mapped[start] || !mapped[start + normNeedle.length - 1]) return null;
+    const endMap = mapped[start + normNeedle.length - 1];
+    try {
+      const range = document.createRange();
+      range.setStart(mapped[start].node, mapped[start].offset);
+      range.setEnd(endMap.node, endMap.offset + 1);
+      const mark = document.createElement('mark');
+      mark.className = 'cwa-find-hl';
+      mark.dataset.score = String(score);
+      mark.style.cssText = 'background:' + color.bg + ';color:' + color.fg + ';border-radius:2px;';
+      try { range.surroundContents(mark); }
+      catch (_) {
+        const frag = range.extractContents();
+        mark.appendChild(frag);
+        range.insertNode(mark);
+      }
+      return mark;
+    } catch (_) {}
+    return null;
+  }
+
   // Phase 1: highlight by chunk element reference — no string-match reversal needed
-  function _applyFindChunk(chunkIdx, score, searchId) {
+  function _applyFindChunk(chunkIdx, score, searchId, evidence) {
     if (_find.searchId !== searchId) return;
     const url = location.href;
     const chunks = _pageChunkCache[url];
@@ -958,11 +1166,39 @@
     } else {
       // Regular FIND_ON_PAGE: apply persistent visual highlight
       const color = _FC[Math.max(1, Math.min(4, score || 2))];
+      const evidenceText = (evidence || '').trim();
+      if (evidenceText) {
+        for (let i = 0; i < _findHighlights.length; i++) {
+          const existing = _findHighlights[i];
+          if (existing.chunkIdx === chunkIdx && existing.evidence === evidenceText) return;
+        }
+        const mark = _tryElementTextHL(el, evidenceText, score || 2, color);
+        if (mark) {
+          _findHighlights.push({ type: 'text', mark, chunkIdx, evidence: evidenceText, score: score || 2, ai: true });
+          updateFindCounter();
+          if (!_find.suppressAutoNav && (score || 2) >= 3 && _find.aiNavSearchId !== searchId) {
+            _find.aiNavSearchId = searchId;
+            navigateFindMatchAbsolute(_findHighlights.length - 1);
+          }
+          return;
+        }
+      }
+      for (let i = 0; i < _findHighlights.length; i++) {
+        const existing = _findHighlights[i];
+        if (existing.type === 'elem' && existing.chunkIdx === chunkIdx) {
+          existing.score = Math.max(existing.score || 0, score || 2);
+          existing.color = _FC[Math.max(1, Math.min(4, existing.score))];
+          existing.el.style.outline = '2px solid ' + existing.color.bg;
+          existing.el.style.background = existing.color.bg + '26';
+          updateFindCounter();
+          return;
+        }
+      }
       const origOutline = el.style.outline;
       const origBg = el.style.background;
       el.style.outline = '2px solid ' + color.bg;
       el.style.background = color.bg + '26';
-      _findHighlights.push({ type: 'elem', el, origOutline, origBg, color, score });
+      _findHighlights.push({ type: 'elem', el, origOutline, origBg, color, score, chunkIdx });
       updateFindCounter();
       if (!_find.suppressAutoNav && _findActive < 0 && _findHighlights.length) {
         navigateFindMatchAbsolute(0);
@@ -1253,7 +1489,7 @@
     const menu = document.createElement('div');
     menu.className = 'cwa-effort-menu';
     menu.style.cssText = 'position:fixed;z-index:2147483647;background:#18181b;border:1px solid #3a3a50;border-radius:4px;padding:4px;display:flex;flex-direction:column;gap:2px;box-shadow:0 8px 28px rgba(0,0,0,.45);';
-    ['balanced', 'deep'].forEach(function(effort) {
+    ['instant', 'balanced', 'deep'].forEach(function(effort) {
       const b = document.createElement('button');
       b.textContent = effort.toUpperCase();
       b.style.cssText = 'background:none;border:1px solid transparent;color:#d0d0d8;font:10px monospace;padding:4px 8px;text-align:left;cursor:pointer;border-radius:2px;';
@@ -1365,11 +1601,11 @@
       const next = _FLOAT_MODELS[(idx + 1) % _FLOAT_MODELS.length];
       _float.model = next[0];
       modelBadge.textContent = next[0].split('/').pop().slice(0, 18).toUpperCase();
-      chrome.storage.sync.set({ cwaModel: next[0], cwaProvider: next[1] });
+      setSync({ cwaModel: next[0], cwaProvider: next[1] });
     });
     const effortBtn = document.createElement('button');
     effortBtn.textContent = _float.effort.toUpperCase();
-    effortBtn.title = 'Use balanced or deep mode for this page float';
+    effortBtn.title = 'Choose page float mode';
     effortBtn.style.cssText = 'background:none;border:1px solid #3a3a50;border-radius:2px;color:#7090b0;font:9px monospace;padding:2px 5px;cursor:pointer;letter-spacing:1px;transition:all .15s;flex-shrink:0;';
     effortBtn.addEventListener('mouseenter', function() {
       _showEffortMenu(effortBtn, function(effort) {
@@ -1460,10 +1696,10 @@
     _float.sendBtn.style.borderColor = '#2a2a38';
     _float.statusTxt.textContent = 'READY';
     _float.statusDot.style.background = '#4dfa9a';
-    const effortBtn = _float.panel ? _float.panel.querySelector('button[title="Use balanced or deep mode for this page float"]') : null;
+    const effortBtn = _float.panel ? _float.panel.querySelector('button[title="Choose page float mode"]') : null;
     if (effortBtn) effortBtn.textContent = _float.effort.toUpperCase();
 
-    chrome.storage.sync.get(['cwaModel'], function(r) {
+    getSync(['cwaModel'], function(r) {
       _float.model = r.cwaModel || 'gpt-4o';
       _float.modelBadge.textContent = (_float.model).split('/').pop().slice(0, 18).toUpperCase();
     });
@@ -1481,9 +1717,7 @@
       SEL.reset();
     } else {
       // Handoff path — keep HL alive if sidebar is taking over
-      chrome.storage.session.get('cwaSpOpen', function(d) {
-        if (!d.cwaSpOpen) SEL.reset();
-      });
+      isSidePanelOpen(function(open) { if (!open) SEL.reset(); });
     }
   }
 
@@ -1613,7 +1847,7 @@
           if (delta.length >= 200) {
             window.__cwa_delta__ = delta.slice(0, 5000);
             // Relay to sidepanel so QUERY messages can include page delta
-            try { chrome.storage.session.set({ cwaPageDelta: { text: window.__cwa_delta__, url, ts: Date.now() } }); } catch(_) {}
+            setSession('cwaPageDelta', { text: window.__cwa_delta__, url, ts: Date.now() });
           }
         }
         lastSnapshot = newText.slice(0, 25000);
@@ -1628,6 +1862,6 @@
   // Phase 0-B: teardown observer on page unload
   window.addEventListener('beforeunload', function() {
     if (_pageObserver) { _pageObserver.disconnect(); _pageObserver = null; }
-    try { chrome.storage.session.remove('cwaPageDelta'); } catch(_) {}
+    removeSession('cwaPageDelta');
   });
 })();

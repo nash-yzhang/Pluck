@@ -23,6 +23,21 @@ function getEffortBudget(effort) {
   return CWA_EFFORTS[normalizeEffort(effort)];
 }
 
+function capFindCandidates(idxs, chunks, maxChars, maxCount) {
+  const out = [];
+  let chars = 0;
+  for (let i = 0; i < idxs.length && out.length < maxCount; i++) {
+    const idx = idxs[i];
+    const c = chunks[idx];
+    if (!c) continue;
+    const len = normalizeText(c.text || c.textPreview || '').length;
+    if (out.length && chars + len > maxChars) continue;
+    out.push(idx);
+    chars += len;
+  }
+  return out;
+}
+
 // In-memory set of tabIds where the side panel is currently open.
 // Kept in sync with cwaSpOpen in session storage, but readable synchronously
 // so sidePanel.open() can be called without any async hop (preserves user-gesture context).
@@ -390,15 +405,20 @@ async function parseProviderError(response, provider) {
   return message;
 }
 
-async function streamOpenAICompatible(provider, apiKey, model, messages, onChunk) {
+async function streamOpenAICompatible(provider, apiKey, model, messages, onChunk, opts) {
   const cfg = cwaGetProviderConfig(provider);
+  const body = Object.assign({
+    model,
+    messages,
+    stream: true,
+  }, opts || {});
   const response = await fetch(cfg.endpoint, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       'Authorization': 'Bearer ' + apiKey,
     },
-    body: JSON.stringify({ model, messages, stream: true }),
+    body: JSON.stringify(normalizeOpenAICompatibleBody(provider, body)),
   });
 
   if (!response.ok) throw new Error(await parseProviderError(response, cfg.label));
@@ -433,7 +453,7 @@ async function streamOpenAICompatible(provider, apiKey, model, messages, onChunk
   return fullText;
 }
 
-async function streamAnthropic(apiKey, model, system, messages, onChunk) {
+async function streamAnthropic(apiKey, model, system, messages, onChunk, opts) {
   const cfg = cwaGetProviderConfig('claude');
   const claudeHeaders = {
     'Content-Type': 'application/json',
@@ -451,7 +471,7 @@ async function streamAnthropic(apiKey, model, system, messages, onChunk) {
       model,
       system,
       messages,
-      max_tokens: 4096,
+      max_tokens: (opts && opts.max_tokens) || 4096,
       stream: true,
     }),
   });
@@ -511,16 +531,16 @@ function normalizeOpenAICompatibleBody(provider, body) {
   return normalized;
 }
 
-async function streamProviderResponse(provider, apiKey, model, messageData, onChunk) {
+async function streamProviderResponse(provider, apiKey, model, messageData, onChunk, opts) {
   if (provider === 'claude') {
-    return streamAnthropic(apiKey, model, messageData.system, messageData.messages, onChunk);
+    return streamAnthropic(apiKey, model, messageData.system, messageData.messages, onChunk, opts);
   }
 
   // Flatten array system (Claude format) to string for OpenAI-compatible providers
   const sysContent = Array.isArray(messageData.system)
     ? messageData.system.map(b => b.text).join('\n\n')
     : messageData.system;
-  return streamOpenAICompatible(provider, apiKey, model, [{ role: 'system', content: sysContent }].concat(messageData.messages), onChunk);
+  return streamOpenAICompatible(provider, apiKey, model, [{ role: 'system', content: sysContent }].concat(messageData.messages), onChunk, opts);
 }
 
 async function requestOpenAICompatibleJson(provider, apiKey, body) {
@@ -786,6 +806,18 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
     }
     return false;
   }
+  if (msg.type === 'REMOVE_SESSION') {
+    if (msg.key) chrome.storage.session.remove(msg.key);
+    return false;
+  }
+  if (msg.type === 'GET_SYNC') {
+    chrome.storage.sync.get(msg.keys || null, function(r) { respond(r || {}); });
+    return true;
+  }
+  if (msg.type === 'SET_SYNC') {
+    if (msg.values && typeof msg.values === 'object') chrome.storage.sync.set(msg.values);
+    return false;
+  }
   // content.js hotkey → open the sidebar and set the goChat flag for capture mode
   if (msg.type === 'OPEN_SIDE_PANEL') {
     // sidePanel.open() requires user-gesture context. We must NOT have any async hop
@@ -924,13 +956,24 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
   // ── AI-powered on-page find (Alt+S panel fallback) ─────────────────────
   if (msg.type === 'FIND_ON_PAGE') {
     const tabId = sender.tab && sender.tab.id;
-    const { query, chunks, mode, searchId, bm25Only, effort } = msg.payload;
+    const { query, chunks, mode, searchId, bm25Only, localFirst, effort } = msg.payload;
     const findEffort = normalizeEffort(effort);
     const findBudget = getEffortBudget(findEffort);
     respond({ started: true }); // release the sendMessage callback immediately
     (async () => {
-      const sendChunk = (chunkIdx, score) => {
-        if (tabId) chrome.tabs.sendMessage(tabId, { type: 'FIND_CHUNK', chunkIdx, score, searchId }).catch(() => {});
+      const sendDebug = (stage, data) => {
+        try { console.log('[CWA-FIND-BG]', '#' + searchId, stage, data); } catch (_) {}
+        if (tabId) chrome.tabs.sendMessage(tabId, { type: 'FIND_DEBUG', searchId, stage, data }).catch(() => {});
+      };
+      const sendChunk = (chunkIdx, score, evidence) => {
+        if (tabId) chrome.tabs.sendMessage(tabId, { type: 'FIND_CHUNK', chunkIdx, score, searchId, evidence: evidence || '' }).catch(() => {});
+      };
+      const verifiedEvidence = (chunkIdx, evidence) => {
+        const c = chunks[chunkIdx];
+        const ev = normalizeText(evidence);
+        if (!c || ev.length < 4) return '';
+        const hay = normalizeText(c.text || c.textPreview || '');
+        return hay.indexOf(ev) !== -1 ? ev : '';
       };
       // lowConf = vocabulary/language mismatch: use larger budget so LLM sees more candidates.
       // highConf = BM25 found keyword matches: tighter budget, stitch ±1 for boundary safety.
@@ -948,53 +991,75 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
           if (i < chunks.length - 1) stitchedSet.add(i + 1);
         });
       }
-      // lowConf: cap at 60 chunks (wide sweep); highConf: cap at 40
-      const hardCap = isLowConf ? findBudget.findCap : Math.min(findBudget.findCap, 40);
-      const selected = Array.from(stitchedSet).sort(function(a, b) { return a - b; }).slice(0, hardCap);
+      const stitched = Array.from(stitchedSet).sort(function(a, b) { return a - b; });
+      const allInPageOrder = chunks.map(function(c) { return c.idx; });
+      const optimizeBudget = localFirst
+        ? { chars: 3000, count: 16, snippet: 260, localHits: 0, maxResults: 12 }
+        : { chars: findBudget.findChars, count: isLowConf ? findBudget.findCap : Math.min(findBudget.findCap, 40), snippet: 650, localHits: 0, maxResults: 20 };
+      const selected = capFindCandidates(isLowConf ? allInPageOrder : stitched, chunks, optimizeBudget.chars, optimizeBudget.count);
+      sendDebug('candidates', {
+        query,
+        effort: findEffort,
+        bm25Only: !!bm25Only,
+        localFirst: !!localFirst,
+        lowConf: !!isLowConf,
+        chunksTotal: chunks.length,
+        rawIdxs: rawIdxs.slice(0, 20),
+        selected: selected.map(function(i) {
+          const c = chunks[i] || {};
+          return { idx: i, text: normalizeText(c.text || c.textPreview || '').slice(0, 180), heading: c.headingPath || '' };
+        }),
+      });
 
-      // bm25Only: sidebar AUTO_FIND path — skip LLM entirely, highlight BM25 top results directly
+      // Local-first: show BM25 hits immediately, then optionally let LLM refine/expand async.
+      if (bm25Only || localFirst) {
+        rawIdxs.slice(0, bm25Only ? 12 : optimizeBudget.localHits).forEach(function(i) { sendChunk(i, 2); });
+      }
+
+      // bm25Only: sidebar AUTO_FIND path — skip LLM entirely.
       if (bm25Only) {
-        rawIdxs.slice(0, 12).forEach(function(i) { sendChunk(i, 2); });
         if (tabId) chrome.tabs.sendMessage(tabId, { type: 'FIND_DONE', searchId }).catch(() => {});
         return;
       }
 
       const { apiKey, model, provider } = await getConfig();
       if (!apiKey) {
+        sendDebug('no_api_key', { provider });
         if (tabId) chrome.tabs.sendMessage(tabId, { type: 'FIND_DONE', searchId }).catch(() => {});
         return;
       }
       const snippetBlock = selected.map(function(i) {
-        return '[' + i + '] ' + (chunks[i] ? chunks[i].text : '');
+        return '[' + i + '] ' + (chunks[i] ? normalizeText(chunks[i].text || chunks[i].textPreview || '').slice(0, optimizeBudget.snippet) : '');
       }).join('\n');
-      // mode: 1=strict(scores 3-4), 2=related(2-4), 3=general(1-4), 4=broad(1-4)
-      const modeInstructions = [
-        '',
-        'Return only chunks with score 3 or 4. Exact or very close semantic match only.',
-        'Return chunks semantically related to the query. Score 2-4.',
-        'Return chunks generally related to the query topic. Score 1-4.',
-        'Return any chunk broadly related to the query. Score 1-4.',
-      ];
-      const safeMode = Math.max(1, Math.min(4, mode || 2));
-      // lowConf: BM25 found no keyword match — query and page likely differ in vocabulary or language.
-      // Instruct LLM to reason about meaning, not surface words.
+      // lowConf: BM25 found no keyword match. The query may be a field label in another language,
+      // so selected candidates are page-order visible snippets and the model maps meaning.
       const semanticNote = isLowConf
         ? 'IMPORTANT: The query and page content may use different vocabulary or different languages. ' +
-          'Match by MEANING and CONCEPT, not by literal words. Cross-language matching is expected.\n\n'
+          'Match by MEANING and PAGE FIELD ROLE, not by literal words. Cross-language matching is expected.\n\n'
         : '';
       const prompt =
         semanticNote +
-        'Find numbered text chunks that match the user query.\n' +
-        modeInstructions[safeMode] + '\n\n' +
+        'You are a semantic page-field locator.\n' +
+        'Task: find ALL visible page fields/snippets whose meaning is related to the user query.\n' +
+        'The query may be a field name, label, short phrase, or question. Do NOT answer the question. Locate page text.\n' +
+        'For each match, copy the shortest exact visible substring that should be highlighted. Use a complete field value/name when possible; include label + value only when needed.\n\n' +
         'Output one JSON object per line (NDJSON). No other text:\n' +
-        '{"chunkIdx":N,"score":4}\n' +
-        'Scores: 4=exact/equivalent match, 3=closely related, 2=generally related, 1=broad.\n' +
-        'Max 12 results. chunkIdx must be one of the numbers in the list below.\n\n' +
+        '{"chunkIdx":N,"score":4,"evidence":"exact visible substring copied from that chunk"}\n' +
+        'Scores: 4=direct field/value match, 3=strongly related field/snippet, 2=related context. Do not return score 1.\n' +
+        'evidence MUST be copied verbatim from the chosen chunk text. Do not paraphrase, translate, explain, or invent.\n' +
+        'Return at most ' + optimizeBudget.maxResults + ' results. chunkIdx must be one of the numbers in the list below.\n\n' +
         'User query: ' + query + '\n\nChunks:\n' + snippetBlock;
+      sendDebug('llm_request', {
+        provider,
+        model,
+        promptChars: prompt.length,
+        selectedCount: selected.length,
+        promptPreview: prompt.slice(0, 1200),
+      });
       let buffer = '';
       try {
         await streamProviderResponse(provider, apiKey, model, {
-          system: 'Output NDJSON only. Each line: {"chunkIdx":N,"score":M}. No markdown, no extra text.',
+          system: 'Output NDJSON only. Each line: {"chunkIdx":N,"score":M,"evidence":"exact substring"}. No markdown, no extra text.',
           messages: [{ role: 'user', content: prompt }],
         }, delta => {
           buffer += delta;
@@ -1003,19 +1068,42 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
             const line = buffer.slice(0, nl).trim();
             buffer = buffer.slice(nl + 1);
             if (!line) continue;
+            sendDebug('llm_raw_line', { line });
             try {
               const obj = JSON.parse(line);
               if (obj && typeof obj.chunkIdx === 'number' && typeof obj.score === 'number') {
-                sendChunk(obj.chunkIdx, obj.score);
+                const ev = verifiedEvidence(obj.chunkIdx, obj.evidence);
+                if (ev) {
+                  sendDebug('accepted', { chunkIdx: obj.chunkIdx, score: obj.score, evidence: ev });
+                  sendChunk(obj.chunkIdx, obj.score, ev);
+                } else {
+                  sendDebug('rejected', { chunkIdx: obj.chunkIdx, score: obj.score, evidence: obj.evidence || '', reason: 'evidence_not_in_chunk' });
+                }
               }
-            } catch(_) {}
+            } catch(e) { sendDebug('parse_error', { line, error: e.message }); }
           }
-        });
+        }, provider === 'claude' ? { max_tokens: 512 } : { max_completion_tokens: 512, temperature: 0 });
         const rem = buffer.trim();
-        if (rem) { try { const obj = JSON.parse(rem); if (obj && typeof obj.chunkIdx === 'number') sendChunk(obj.chunkIdx, obj.score || 2); } catch(_) {} }
+        if (rem) {
+          sendDebug('llm_raw_remainder', { line: rem });
+          try {
+            const obj = JSON.parse(rem);
+            if (obj && typeof obj.chunkIdx === 'number') {
+              const ev = verifiedEvidence(obj.chunkIdx, obj.evidence);
+              if (ev) {
+                sendDebug('accepted', { chunkIdx: obj.chunkIdx, score: obj.score || 2, evidence: ev });
+                sendChunk(obj.chunkIdx, obj.score || 2, ev);
+              } else {
+                sendDebug('rejected', { chunkIdx: obj.chunkIdx, score: obj.score || 2, evidence: obj.evidence || '', reason: 'evidence_not_in_chunk' });
+              }
+            }
+          } catch(e) { sendDebug('parse_error', { line: rem, error: e.message }); }
+        }
       } catch(e) {
+        sendDebug('llm_error', { error: e.message });
         ERR('FIND_ON_PAGE stream error:', e.message);
       }
+      sendDebug('done', {});
       if (tabId) chrome.tabs.sendMessage(tabId, { type: 'FIND_DONE', searchId }).catch(() => {});
     })();
     return false; // respond() already called synchronously
